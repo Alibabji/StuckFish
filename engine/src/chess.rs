@@ -1401,7 +1401,7 @@ impl Board {
         gain[0]
     }
 
-    fn move_is_legal(&self, mv: Move) -> bool {
+    pub fn move_is_legal(&self, mv: Move) -> bool {
         let mut clone = self.clone();
         clone.move_is_legal_mut(mv)
     }

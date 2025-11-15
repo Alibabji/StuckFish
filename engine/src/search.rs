@@ -1,6 +1,10 @@
 use crate::chess::{Board, Move, MoveList, PieceKind, piece_value};
 use crate::nnue_runtime::NnueRuntime;
 use crate::tt::{Bound, TranspositionTable};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
@@ -16,6 +20,7 @@ struct SearchState {
     killer_moves: [[Option<Move>; 2]; MAX_PLY],
     history: [[u32; 64]; 64],
     deadline: Option<Instant>,
+    abort_flag: Option<Arc<AtomicBool>>,
     stopped: bool,
 }
 
@@ -26,11 +31,12 @@ fn move_indices(mv: Move) -> (usize, usize) {
 }
 
 impl SearchState {
-    fn new(deadline: Option<Instant>) -> Self {
+    fn new(deadline: Option<Instant>, abort_flag: Option<Arc<AtomicBool>>) -> Self {
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
             deadline,
+            abort_flag,
             stopped: false,
         }
     }
@@ -64,6 +70,12 @@ impl SearchState {
     fn should_stop(&mut self) -> bool {
         if self.stopped {
             return true;
+        }
+        if let Some(flag) = &self.abort_flag {
+            if flag.load(Ordering::Relaxed) {
+                self.stopped = true;
+                return true;
+            }
         }
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
@@ -106,6 +118,7 @@ pub fn search_best_move(
     max_depth: u8,
     time_budget: Option<Duration>,
     nnue_runner: &NnueRuntime,
+    abort_flag: Option<Arc<AtomicBool>>,
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
@@ -121,7 +134,7 @@ pub fn search_best_move(
 
     let start = Instant::now();
     let deadline = time_budget.map(|budget| start + budget);
-    let mut state = SearchState::new(deadline);
+    let mut state = SearchState::new(deadline, abort_flag.clone());
 
     let mut best_move = None;
     let mut completed_depth = 0;
