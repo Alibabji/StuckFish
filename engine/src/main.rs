@@ -12,7 +12,7 @@ use tch::Device;
 #[command(about = "Suckfish: a homemade chess engine", author, version)]
 struct CmdArgs {
     /// NNUE weight file
-    #[arg(long, value_name = "NNUE_PATH", default_value = "nnue/network.ot")]
+    #[arg(long, value_name = "NNUE_PATH", default_value = "nnue.ot")]
     nnue_path: PathBuf,
 }
 

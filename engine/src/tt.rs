@@ -1,5 +1,3 @@
-//! Simple fixed-size transposition table.
-
 use std::mem;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
