@@ -1,3 +1,4 @@
+use crate::chess::Move;
 use std::mem;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,7 @@ struct Entry {
     depth: u8,
     used: bool,
     bound: Bound,
+    best_move: Option<Move>,
 }
 
 impl Entry {
@@ -24,6 +26,7 @@ impl Entry {
             depth: 0,
             used: false,
             bound: Bound::Exact,
+            best_move: None,
         }
     }
 }
@@ -33,6 +36,7 @@ pub struct TableEntry {
     pub value: i32,
     pub depth: u8,
     pub bound: Bound,
+    pub best_move: Option<Move>,
 }
 
 /// Replacement scheme that keeps the deepest stored position per bucket.
@@ -76,7 +80,14 @@ impl TranspositionTable {
     }
 
     /// Store a search result keyed by the position hash.
-    pub fn store(&mut self, key: u64, depth: u8, value: i32, bound: Bound) {
+    pub fn store(
+        &mut self,
+        key: u64,
+        depth: u8,
+        value: i32,
+        bound: Bound,
+        best_move: Option<Move>,
+    ) {
         let idx = self.index(key);
         let slot = &mut self.entries[idx];
 
@@ -94,6 +105,7 @@ impl TranspositionTable {
             depth,
             used: true,
             bound,
+            best_move,
         };
     }
 
@@ -106,6 +118,7 @@ impl TranspositionTable {
                 value: entry.value,
                 depth: entry.depth,
                 bound: entry.bound,
+                best_move: entry.best_move,
             })
         } else {
             None
@@ -120,7 +133,7 @@ mod tests {
     #[test]
     fn store_and_probe_round_trip() {
         let mut tt = TranspositionTable::new(1);
-        tt.store(0x1234, 5, 42, Bound::Exact);
+        tt.store(0x1234, 5, 42, Bound::Exact, None);
         let entry = tt.probe(0x1234).expect("entry");
         assert_eq!(entry.value, 42);
         assert_eq!(entry.depth, 5);
@@ -130,14 +143,14 @@ mod tests {
     #[test]
     fn replacement_prefers_deeper_entry() {
         let mut tt = TranspositionTable::new(1);
-        tt.store(0x1, 2, 7, Bound::Exact);
-        tt.store(0x1, 5, 8, Bound::Lower);
+        tt.store(0x1, 2, 7, Bound::Exact, None);
+        tt.store(0x1, 5, 8, Bound::Lower, None);
         let entry = tt.probe(0x1).expect("entry");
         assert_eq!(entry.value, 8);
         assert_eq!(entry.depth, 5);
         assert_eq!(entry.bound, Bound::Lower);
 
-        tt.store(0x1, 3, 9, Bound::Upper);
+        tt.store(0x1, 3, 9, Bound::Upper, None);
         let entry = tt.probe(0x1).expect("entry");
         assert_eq!(entry.value, 8);
         assert_eq!(entry.depth, 5);
@@ -146,7 +159,7 @@ mod tests {
     #[test]
     fn clear_resets_entries() {
         let mut tt = TranspositionTable::new(1);
-        tt.store(0x42, 1, 100, Bound::Exact);
+        tt.store(0x42, 1, 100, Bound::Exact, None);
         assert!(tt.probe(0x42).is_some());
         tt.clear();
         assert!(tt.probe(0x42).is_none());

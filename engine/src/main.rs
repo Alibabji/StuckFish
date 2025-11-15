@@ -35,7 +35,8 @@ fn main() -> Result<()> {
                 };
                 let fen = &cmdline[(time_left.len() + 4)..];
                 let board = Board::from_fen(fen)?;
-                let sr = search_best_move(&board, &mut tt, 4, &nnue_runner);
+                let sr = search_best_move(&board, &mut tt, 5, &nnue_runner);
+                eprintln!("{:?}, nps: {}", sr, sr.nps());
                 if let Some(bm) = sr.best_move {
                     println!("{}", bm.to_uci());
                 }

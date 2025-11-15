@@ -1,13 +1,62 @@
-use crate::chess::{Board, Move};
+use crate::chess::{Board, Move, PieceKind};
 use crate::nnue::NnueRunner;
 use crate::tt::{Bound, TranspositionTable};
 use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
+const MAX_PLY: usize = 64;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
     pub nodes: u64,
+}
+
+#[derive(Clone)]
+struct SearchState {
+    killer_moves: [[Option<Move>; 2]; MAX_PLY],
+    history: [[u32; 64]; 64],
+}
+
+fn move_indices(mv: Move) -> (usize, usize) {
+    let from =
+        mv.from.rank() as usize * 8 + mv.from.file() as usize;
+    let to = mv.to.rank() as usize * 8 + mv.to.file() as usize;
+    (from, to)
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            killer_moves: [[None; 2]; MAX_PLY],
+            history: [[0; 64]; 64],
+        }
+    }
+
+    fn killer_moves(&self, ply: usize) -> [Option<Move>; 2] {
+        self.killer_moves[ply.min(MAX_PLY - 1)]
+    }
+
+    fn record_killer(&mut self, ply: usize, mv: Move) {
+        let idx = ply.min(MAX_PLY - 1);
+        if self.killer_moves[idx].contains(&Some(mv)) {
+            return;
+        }
+        self.killer_moves[idx][1] = self.killer_moves[idx][0];
+        self.killer_moves[idx][0] = Some(mv);
+    }
+
+    fn record_history(&mut self, mv: Move, depth: u8) {
+        let (from, to) = move_indices(mv);
+        const HISTORY_LIMIT: u32 = 1_000_000;
+        let bonus = (depth as u32) * (depth as u32);
+        let entry = &mut self.history[from][to];
+        *entry = entry.saturating_add(bonus).min(HISTORY_LIMIT);
+    }
+
+    fn history_score(&self, mv: Move) -> i32 {
+        let (from, to) = move_indices(mv);
+        self.history[from][to] as i32
+    }
 }
 
 impl SearchStatistics {
@@ -41,8 +90,10 @@ pub fn search_best_move(
     depth: u8,
     nnue_runner: &NnueRunner,
 ) -> SearchReport {
-    let moves = board.legal_moves();
-    if moves.is_empty() {
+    let root_moves = board.legal_moves();
+    let mut stats = SearchStatistics::default();
+    let mut state = SearchState::new();
+    if root_moves.is_empty() {
         return SearchReport {
             best_move: None,
             depth,
@@ -52,11 +103,72 @@ pub fn search_best_move(
     }
 
     let start = Instant::now();
+    if depth == 0 {
+        let (best_move, _) = search_single_depth(
+            board,
+            tt,
+            depth,
+            &root_moves,
+            None,
+            &mut stats,
+            &mut state,
+            nnue_runner,
+        );
+        return SearchReport {
+            best_move,
+            depth: 0,
+            stats,
+            elapsed: start.elapsed(),
+        };
+    }
+
+    let mut best_move = None;
+    let mut completed_depth = 0;
+    for current_depth in 1..=depth {
+        let (candidate_move, _) = search_single_depth(
+            board,
+            tt,
+            current_depth,
+            &root_moves,
+            best_move,
+            &mut stats,
+            &mut state,
+            nnue_runner,
+        );
+        if candidate_move.is_none() {
+            break;
+        }
+        best_move = candidate_move;
+        completed_depth = current_depth;
+    }
+
+    SearchReport {
+        best_move,
+        depth: completed_depth,
+        stats,
+        elapsed: start.elapsed(),
+    }
+}
+
+fn search_single_depth(
+    board: &Board,
+    tt: &mut TranspositionTable,
+    depth: u8,
+    root_moves: &[Move],
+    preferred: Option<Move>,
+    stats: &mut SearchStatistics,
+    state: &mut SearchState,
+    nnue_runner: &NnueRunner,
+) -> (Option<Move>, i32) {
+    let mut moves = root_moves.to_vec();
+    let tt_move = tt.probe(board.hash()).and_then(|entry| entry.best_move);
+    let killers = state.killer_moves(0);
+    order_moves(board, &mut moves, preferred, tt_move, killers, state);
+
     let mut best_move = None;
     let mut best_score = -MATE_VALUE;
     let mut alpha = -MATE_VALUE;
     let beta = MATE_VALUE;
-    let mut stats = SearchStatistics::default();
 
     for mv in moves {
         let mut next = board.clone();
@@ -67,7 +179,9 @@ pub fn search_best_move(
             depth.saturating_sub(1),
             -beta,
             -alpha,
-            &mut stats,
+            stats,
+            state,
+            1,
             nnue_runner,
         );
         if score > best_score {
@@ -75,14 +189,12 @@ pub fn search_best_move(
             best_move = Some(mv);
         }
         alpha = alpha.max(best_score);
+        if alpha >= beta {
+            break;
+        }
     }
 
-    SearchReport {
-        best_move,
-        depth,
-        stats,
-        elapsed: start.elapsed(),
-    }
+    (best_move, best_score)
 }
 
 fn negamax(
@@ -92,6 +204,8 @@ fn negamax(
     mut alpha: i32,
     mut beta: i32,
     stats: &mut SearchStatistics,
+    state: &mut SearchState,
+    ply: usize,
     nnue_runner: &NnueRunner,
 ) -> i32 {
     stats.record_node();
@@ -100,26 +214,30 @@ fn negamax(
     let beta_orig = beta;
 
     let key = board.hash();
-    if let Some(entry) = tt.probe(key)
-        && entry.depth >= depth
-    {
-        match entry.bound {
-            Bound::Exact => return entry.value,
-            Bound::Lower => alpha = alpha.max(entry.value),
-            Bound::Upper => beta = beta.min(entry.value),
-        }
-        if alpha >= beta {
-            return entry.value;
+    let mut tt_move = None;
+    if let Some(entry) = tt.probe(key) {
+        tt_move = entry.best_move;
+        if entry.depth >= depth {
+            match entry.bound {
+                Bound::Exact => return entry.value,
+                Bound::Lower => alpha = alpha.max(entry.value),
+                Bound::Upper => beta = beta.min(entry.value),
+            }
+            if alpha >= beta {
+                return entry.value;
+            }
         }
     }
 
     if depth == 0 {
         let eval = nnue_runner.eval(board).unwrap_or(-MATE_VALUE);
-        tt.store(key, depth, eval, Bound::Exact);
+        tt.store(key, depth, eval, Bound::Exact, None);
         return eval;
     }
 
-    let moves = board.legal_moves();
+    let mut moves = board.legal_moves();
+    let killers = state.killer_moves(ply);
+    order_moves(board, &mut moves, None, tt_move, killers, state);
     if moves.is_empty() {
         if board.is_in_check(board.active_color) {
             return -MATE_VALUE + depth as i32;
@@ -129,7 +247,9 @@ fn negamax(
     }
 
     let mut best_value = -MATE_VALUE;
+    let mut best_move = None;
     for mv in moves {
+        let is_capture = board.piece_at(mv.to).is_some();
         let mut child = board.clone();
         child.apply_move_unchecked(mv);
         let score = -negamax(
@@ -139,11 +259,20 @@ fn negamax(
             -beta,
             -alpha,
             stats,
+            state,
+            ply + 1,
             nnue_runner,
         );
-        best_value = best_value.max(score);
+        if score > best_value {
+            best_value = score;
+            best_move = Some(mv);
+        }
         alpha = alpha.max(score);
         if alpha >= beta {
+            if !is_capture {
+                state.record_killer(ply, mv);
+                state.record_history(mv, depth);
+            }
             break;
         }
     }
@@ -155,6 +284,77 @@ fn negamax(
     } else {
         Bound::Exact
     };
-    tt.store(key, depth, best_value, bound);
+    tt.store(key, depth, best_value, bound, best_move);
     best_value
+}
+
+fn order_moves(
+    board: &Board,
+    moves: &mut [Move],
+    preferred: Option<Move>,
+    tt_move: Option<Move>,
+    killer_moves: [Option<Move>; 2],
+    state: &SearchState,
+) {
+    moves.sort_by_key(|mv| move_score(board, *mv, preferred, tt_move, killer_moves, state));
+    moves.reverse();
+}
+
+fn move_score(
+    board: &Board,
+    mv: Move,
+    preferred: Option<Move>,
+    tt_move: Option<Move>,
+    killer_moves: [Option<Move>; 2],
+    state: &SearchState,
+) -> i32 {
+    const PREFERRED_BONUS: i32 = 1_000_000;
+    const PROMOTION_BONUS: i32 = 50_000;
+    const CAPTURE_BONUS: i32 = 10_000;
+    const TT_BONUS: i32 = 2_000_000;
+    const KILLER_BONUS: i32 = 30_000;
+
+    let mut score = 0;
+    if tt_move == Some(mv) {
+        score += TT_BONUS;
+    }
+
+    if preferred == Some(mv) {
+        score += PREFERRED_BONUS;
+    }
+
+    if let Some(killer) = killer_moves[0] {
+        if killer == mv {
+            score += KILLER_BONUS;
+        }
+    }
+    if let Some(killer) = killer_moves[1] {
+        if killer == mv {
+            score += KILLER_BONUS / 2;
+        }
+    }
+
+    if let Some(moving) = board.piece_at(mv.from) {
+        if moving.kind == PieceKind::Pawn && (mv.to.rank() == 0 || mv.to.rank() == 7) {
+            score += PROMOTION_BONUS;
+        }
+        if let Some(captured) = board.piece_at(mv.to) {
+            score += CAPTURE_BONUS + piece_value(captured.kind) - piece_value(moving.kind);
+        }
+    }
+
+    score += state.history_score(mv);
+
+    score
+}
+
+fn piece_value(kind: PieceKind) -> i32 {
+    match kind {
+        PieceKind::Pawn => 100,
+        PieceKind::Knight => 300,
+        PieceKind::Bishop => 325,
+        PieceKind::Rook => 500,
+        PieceKind::Queen => 900,
+        PieceKind::King => 10_000,
+    }
 }

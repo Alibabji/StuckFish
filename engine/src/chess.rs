@@ -1,7 +1,6 @@
 use anyhow::{Error as E, Result};
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct FenError(String);
@@ -40,6 +39,10 @@ impl Color {
             Color::Black => Color::White,
         }
     }
+
+    fn idx(self) -> usize {
+        self as usize
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -63,6 +66,12 @@ impl From<usize> for PieceKind {
             5 => Self::King,
             _ => panic!("Cannot convert from {} to PieceKind.", v),
         }
+    }
+}
+
+impl PieceKind {
+    fn idx(self) -> usize {
+        self as usize
     }
 }
 
@@ -132,6 +141,10 @@ impl Square {
         (self.rank as usize, self.file as usize)
     }
 
+    fn to_index(self) -> usize {
+        self.rank as usize * 8 + self.file as usize
+    }
+
     pub fn to_algebraic(self) -> String {
         let rank_char = (b'1' + self.rank) as char;
         let file_char = (b'a' + self.file) as char;
@@ -173,6 +186,71 @@ impl Square {
 impl fmt::Display for Square {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_algebraic())
+    }
+}
+
+fn zobrist_keys() -> &'static ZobristKeys {
+    static KEYS: OnceLock<ZobristKeys> = OnceLock::new();
+    KEYS.get_or_init(ZobristKeys::new)
+}
+
+struct ZobristKeys {
+    pieces: [[[u64; 64]; 6]; 2],
+    side_to_move: u64,
+    castling: [u64; 4],
+    en_passant: [u64; 8],
+}
+
+impl ZobristKeys {
+    fn new() -> Self {
+        let mut rng = SplitMix64::new(0xDEAD_BEEF_F00D_BAAD);
+        let mut pieces = [[[0_u64; 64]; 6]; 2];
+        for color in 0..2 {
+            for kind in 0..6 {
+                for square in 0..64 {
+                    pieces[color][kind][square] = rng.next_u64();
+                }
+            }
+        }
+
+        let mut castling = [0_u64; 4];
+        for entry in &mut castling {
+            *entry = rng.next_u64();
+        }
+
+        let mut en_passant = [0_u64; 8];
+        for entry in &mut en_passant {
+            *entry = rng.next_u64();
+        }
+
+        let side_to_move = rng.next_u64();
+
+        Self {
+            pieces,
+            side_to_move,
+            castling,
+            en_passant,
+        }
+    }
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_add(0x9E37_79B9_7F4A_7C15_u64);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 
@@ -283,6 +361,7 @@ pub struct Board {
     pub en_passant: Option<Square>,
     pub halfmove_clock: u32,
     pub fullmove_number: u32,
+    zobrist: u64,
 }
 
 impl Default for Board {
@@ -300,6 +379,7 @@ impl Board {
             en_passant: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            zobrist: 0,
         }
     }
 
@@ -330,23 +410,77 @@ impl Board {
             );
         }
 
-        board.castling_rights = CastlingRights {
+        board.set_castling_rights(CastlingRights {
             white_kingside: true,
             white_queenside: true,
             black_kingside: true,
             black_queenside: true,
-        };
+        });
         board
     }
 
     pub fn set_piece(&mut self, square: Square, piece: Option<Piece>) {
         let (r, f) = square.to_indices();
+        let idx = square.to_index();
+        let keys = zobrist_keys();
+        if let Some(old) = self.squares[r][f] {
+            self.zobrist ^= keys.pieces[old.color.idx()][old.kind.idx()][idx];
+        }
         self.squares[r][f] = piece;
+        if let Some(new_piece) = self.squares[r][f] {
+            self.zobrist ^=
+                keys.pieces[new_piece.color.idx()][new_piece.kind.idx()][idx];
+        }
     }
 
     pub fn piece_at(&self, square: Square) -> Option<Piece> {
         let (r, f) = square.to_indices();
         self.squares[r][f]
+    }
+
+    pub fn set_active_color(&mut self, color: Color) {
+        if self.active_color != color {
+            self.zobrist ^= zobrist_keys().side_to_move;
+            self.active_color = color;
+        }
+    }
+
+    pub fn set_en_passant(&mut self, square: Option<Square>) {
+        let keys = zobrist_keys();
+        if let Some(old) = self.en_passant {
+            self.zobrist ^= keys.en_passant[old.file() as usize];
+        }
+        self.en_passant = square;
+        if let Some(new_sq) = self.en_passant {
+            self.zobrist ^= keys.en_passant[new_sq.file() as usize];
+        }
+    }
+
+    pub fn set_castling_rights(&mut self, rights: CastlingRights) {
+        let old = self.castling_rights;
+        self.castling_rights = rights;
+        self.update_castling_hash(old, rights);
+    }
+
+    fn toggle_active_color(&mut self) {
+        self.zobrist ^= zobrist_keys().side_to_move;
+        self.active_color = self.active_color.opponent();
+    }
+
+    fn update_castling_hash(&mut self, old: CastlingRights, new: CastlingRights) {
+        let keys = zobrist_keys();
+        if old.white_kingside != new.white_kingside {
+            self.zobrist ^= keys.castling[0];
+        }
+        if old.white_queenside != new.white_queenside {
+            self.zobrist ^= keys.castling[1];
+        }
+        if old.black_kingside != new.black_kingside {
+            self.zobrist ^= keys.castling[2];
+        }
+        if old.black_queenside != new.black_queenside {
+            self.zobrist ^= keys.castling[3];
+        }
     }
 
     pub fn play_move(&mut self, mv: Move) -> bool {
@@ -363,18 +497,7 @@ impl Board {
     }
 
     pub fn hash(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        for rank in 0..8 {
-            for file in 0..8 {
-                self.squares[rank][file].hash(&mut hasher);
-            }
-        }
-        self.active_color.hash(&mut hasher);
-        self.castling_rights.hash(&mut hasher);
-        self.en_passant.hash(&mut hasher);
-        self.halfmove_clock.hash(&mut hasher);
-        self.fullmove_number.hash(&mut hasher);
-        hasher.finish()
+        self.zobrist
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, FenError> {
@@ -399,22 +522,25 @@ impl Board {
 
         let mut board = Board::empty();
         Self::parse_placement(placement, &mut board)?;
-        board.active_color = match active {
+        let active_color = match active {
             "w" => Color::White,
             "b" => Color::Black,
             value => {
                 return Err(FenError::new(format!("invalid active color '{value}'")));
             }
         };
+        board.set_active_color(active_color);
 
-        board.castling_rights = Self::parse_castling(castling)?;
-        board.en_passant = if en_passant == "-" {
+        let castling_rights = Self::parse_castling(castling)?;
+        board.set_castling_rights(castling_rights);
+        let ep_square = if en_passant == "-" {
             None
         } else {
             Some(Square::from_algebraic(en_passant).ok_or_else(|| {
                 FenError::new(format!("invalid en passant square '{en_passant}'"))
             })?)
         };
+        board.set_en_passant(ep_square);
 
         board.halfmove_clock = match halfmove_field {
             Some(value) => value
@@ -804,7 +930,7 @@ impl Board {
         let piece = self.piece_at(mv.from).expect("move must have a piece");
         let captured = self.piece_at(mv.to);
 
-        self.update_castling_rights(mv, piece, captured);
+        self.update_castling_after_move(mv, piece, captured);
 
         self.set_piece(mv.from, None);
 
@@ -816,7 +942,7 @@ impl Board {
         }
 
         self.set_piece(mv.to, Some(moved_piece));
-        self.en_passant = None;
+        self.set_en_passant(None);
         self.halfmove_clock =
             if moved_piece.kind == PieceKind::Pawn || captured.is_some() {
                 0
@@ -828,45 +954,54 @@ impl Board {
             self.fullmove_number += 1;
         }
 
-        self.active_color = self.active_color.opponent();
+        self.toggle_active_color();
     }
 
-    fn update_castling_rights(
+    fn update_castling_after_move(
         &mut self,
         mv: Move,
         moving: Piece,
         captured: Option<Piece>,
     ) {
+        let mut rights = self.castling_rights;
         if moving.kind == PieceKind::King {
             match moving.color {
                 Color::White => {
-                    self.castling_rights.white_kingside = false;
-                    self.castling_rights.white_queenside = false;
+                    rights.white_kingside = false;
+                    rights.white_queenside = false;
                 }
                 Color::Black => {
-                    self.castling_rights.black_kingside = false;
-                    self.castling_rights.black_queenside = false;
+                    rights.black_kingside = false;
+                    rights.black_queenside = false;
                 }
             }
         }
 
         if moving.kind == PieceKind::Rook {
-            self.disable_rook_castling(mv.from, moving.color);
+            Self::disable_rook_castling(&mut rights, mv.from, moving.color);
         }
 
         if let Some(captured_piece) = captured
             && captured_piece.kind == PieceKind::Rook
         {
-            self.disable_rook_castling(mv.to, captured_piece.color);
+            Self::disable_rook_castling(&mut rights, mv.to, captured_piece.color);
+        }
+
+        if rights != self.castling_rights {
+            self.set_castling_rights(rights);
         }
     }
 
-    fn disable_rook_castling(&mut self, square: Square, color: Color) {
+    fn disable_rook_castling(
+        rights: &mut CastlingRights,
+        square: Square,
+        color: Color,
+    ) {
         match (color, square.file(), square.rank()) {
-            (Color::White, 0, 0) => self.castling_rights.white_queenside = false,
-            (Color::White, 7, 0) => self.castling_rights.white_kingside = false,
-            (Color::Black, 0, 7) => self.castling_rights.black_queenside = false,
-            (Color::Black, 7, 7) => self.castling_rights.black_kingside = false,
+            (Color::White, 0, 0) => rights.white_queenside = false,
+            (Color::White, 7, 0) => rights.white_kingside = false,
+            (Color::Black, 0, 7) => rights.black_queenside = false,
+            (Color::Black, 7, 7) => rights.black_kingside = false,
             _ => {}
         }
     }
@@ -983,7 +1118,7 @@ impl Board {
             self.halfka_from_white()
         } else {
             let mut flipped = self.flipped();
-            flipped.active_color = Color::White;
+            flipped.set_active_color(Color::White);
             flipped.halfka_from_white()
         }
     }
@@ -1108,10 +1243,10 @@ mod tests {
     #[test]
     fn en_passant_square_must_be_on_third_or_sixth_rank() {
         let mut board = Board::starting_position();
-        board.en_passant = Some(Square::unchecked(0, 0));
+        board.set_en_passant(Some(Square::unchecked(0, 0)));
         assert!(!board.is_legal());
 
-        board.en_passant = Some(Square::unchecked(2, 0));
+        board.set_en_passant(Some(Square::unchecked(2, 0)));
         assert!(board.is_legal());
     }
 
@@ -1163,7 +1298,7 @@ mod tests {
     #[test]
     fn pinned_piece_cannot_move() {
         let mut board = Board::empty();
-        board.active_color = Color::White;
+        board.set_active_color(Color::White);
         board.set_piece(
             Square::unchecked(7, 4),
             Some(Piece::new(Color::White, PieceKind::King)),
@@ -1223,7 +1358,7 @@ mod tests {
     #[test]
     fn halfka_complex_position_1() {
         let mut board = Board::empty();
-        board.active_color = Color::White;
+        board.set_active_color(Color::White);
         board.set_piece(
             Square::unchecked(0, 0),
             Some(Piece::new(Color::White, PieceKind::King)),
@@ -1258,7 +1393,7 @@ mod tests {
     #[test]
     fn halfka_complex_position_2() {
         let mut board = Board::empty();
-        board.active_color = Color::Black;
+        board.set_active_color(Color::Black);
         board.set_piece(
             Square::unchecked(7, 7),
             Some(Piece::new(Color::Black, PieceKind::King)),
@@ -1297,7 +1432,7 @@ mod tests {
     #[test]
     fn halfka_complex_position_3() {
         let mut board = Board::empty();
-        board.active_color = Color::White;
+        board.set_active_color(Color::White);
         board.set_piece(
             Square::unchecked(7, 7),
             Some(Piece::new(Color::Black, PieceKind::King)),
