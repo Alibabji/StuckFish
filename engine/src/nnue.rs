@@ -1,7 +1,8 @@
-use crate::chess::{Board, Color};
+use crate::chess::Board;
 
 use anyhow::{Context, Result, anyhow, bail};
 use csv::{ReaderBuilder, StringRecord};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -15,6 +16,7 @@ const HALF_KA_DIM: i64 = 64 * 12 * 64;
 const DEFAULT_FEATURE_DIM: i64 = 256;
 const DEFAULT_HIDDEN_DIM: i64 = 32;
 const CLIPPED_RELU_CAP: f64 = 127.0;
+const TARGET_CP_CLIP: f32 = 2000.0;
 
 #[derive(Clone, Copy)]
 pub struct NnueConfig {
@@ -42,6 +44,7 @@ pub struct TrainingOptions {
     pub log_interval: usize,
     pub initial_weights: Option<PathBuf>,
     pub seed: Option<i64>,
+    pub dedupe_fens: bool,
 }
 
 impl Default for TrainingOptions {
@@ -54,6 +57,7 @@ impl Default for TrainingOptions {
             log_interval: 50,
             initial_weights: None,
             seed: None,
+            dedupe_fens: false,
         }
     }
 }
@@ -162,6 +166,11 @@ pub fn train_from_csv(
         let mut reader = csv_reader(&csv_path)?;
         let mut batch: Vec<Sample> = Vec::with_capacity(batch_size);
         let mut consumed_this_epoch = 0usize;
+        let mut seen_fens = if options.dedupe_fens {
+            Some(HashSet::with_capacity(per_epoch_target))
+        } else {
+            None
+        };
         for record in reader.records() {
             let record = match record {
                 Ok(rec) => rec,
@@ -170,7 +179,12 @@ pub fn train_from_csv(
                     continue;
                 }
             };
-            if let Some(sample) = parse_sample(&record, fen_idx, cp_idx) {
+            if let Some((sample, hash)) = parse_sample(&record, fen_idx, cp_idx) {
+                if let Some(seen) = seen_fens.as_mut() {
+                    if !seen.insert(hash) {
+                        continue;
+                    }
+                }
                 batch.push(sample);
                 consumed_this_epoch += 1;
             }
@@ -273,7 +287,7 @@ fn parse_sample(
     record: &StringRecord,
     fen_idx: usize,
     cp_idx: usize,
-) -> Option<Sample> {
+) -> Option<(Sample, u64)> {
     let fen = record.get(fen_idx)?.trim();
     if fen.is_empty() {
         return None;
@@ -282,13 +296,14 @@ fn parse_sample(
     if cp_str.is_empty() {
         return None;
     }
-    let cp_value: f32 = match cp_str.parse() {
+    let cp_value_raw: f32 = match cp_str.parse() {
         Ok(value) => value,
         Err(err) => {
             eprintln!("Skipping row with invalid cp '{cp_str}': {err}");
             return None;
         }
     };
+    let cp_value = cp_value_raw.clamp(-TARGET_CP_CLIP, TARGET_CP_CLIP);
 
     let board = match Board::from_fen(fen) {
         Ok(board) => board,
@@ -297,11 +312,8 @@ fn parse_sample(
             return None;
         }
     };
-    let target = if board.active_color == Color::White {
-        cp_value
-    } else {
-        -cp_value
-    };
+    let board_hash = board.hash();
+    let target = cp_value;
     let features = match board.halfka() {
         Ok(f) => f,
         Err(err) => {
@@ -310,7 +322,7 @@ fn parse_sample(
         }
     };
 
-    Some(Sample { features, target })
+    Some((Sample { features, target }, board_hash))
 }
 
 fn active_indices(features: &[f32]) -> Vec<i64> {

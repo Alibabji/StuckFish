@@ -429,7 +429,7 @@ impl Board {
             None => 1,
         };
         if board.fullmove_number == 0 {
-            return Err(FenError::new("fullmove number must be >= 1"));
+            return Err(FenError::new("fullmove number must be > 0"));
         }
 
         Ok(board)
@@ -863,10 +863,10 @@ impl Board {
 
     fn disable_rook_castling(&mut self, square: Square, color: Color) {
         match (color, square.file(), square.rank()) {
-            (Color::White, 0, 7) => self.castling_rights.white_queenside = false,
-            (Color::White, 7, 7) => self.castling_rights.white_kingside = false,
-            (Color::Black, 0, 0) => self.castling_rights.black_queenside = false,
-            (Color::Black, 7, 0) => self.castling_rights.black_kingside = false,
+            (Color::White, 0, 0) => self.castling_rights.white_queenside = false,
+            (Color::White, 7, 0) => self.castling_rights.white_kingside = false,
+            (Color::Black, 0, 7) => self.castling_rights.black_queenside = false,
+            (Color::Black, 7, 7) => self.castling_rights.black_kingside = false,
             _ => {}
         }
     }
@@ -894,8 +894,8 @@ impl Board {
 
     fn square_attacked(&self, square: Square, by: Color) -> bool {
         let pawn_dirs: [(i8, i8); 2] = match by {
-            Color::White => [(1, -1), (1, 1)],
-            Color::Black => [(-1, -1), (-1, 1)],
+            Color::White => [(-1, -1), (-1, 1)],
+            Color::Black => [(1, -1), (1, 1)],
         };
         for (dr, df) in pawn_dirs {
             if let Some(source) = square.offset(dr, df)
@@ -978,14 +978,13 @@ impl Board {
         false
     }
 
-    /// HalfKP from board
-    ///
-    /// 2 sides * 64 king squares * (10 piecekind * 64 squares + 1 bias)
     pub fn halfka(&self) -> Result<Vec<f32>> {
         if self.active_color == Color::White {
             self.halfka_from_white()
         } else {
-            self.flipped().halfka_from_white()
+            let mut flipped = self.flipped();
+            flipped.active_color = Color::White;
+            flipped.halfka_from_white()
         }
     }
 
@@ -1011,9 +1010,7 @@ impl Board {
         let mut features = vec![0_f32; 64 * (12 * 64)];
         let mut king_square = None;
 
-        let square_index = |rank: usize, file: usize| {
-            rank * 8 + if rank < 4 { file } else { 7 - file }
-        };
+        let square_index = |rank: usize, file: usize| rank * 8 + file;
 
         for rank in 0..8 {
             for file in 0..8 {
@@ -1042,7 +1039,7 @@ impl Board {
                 let piecekind = if piece.color == self.active_color {
                     piece.kind as u32
                 } else {
-                    piece.kind as u32 + 5
+                    piece.kind as u32 + 6
                 };
                 idx += piecekind * 64
                     + square_index(rank as usize, file as usize) as u32;
@@ -1189,6 +1186,126 @@ mod tests {
         assert!(
             !moves.contains(&illegal),
             "Pinned rook should not be allowed to move"
+        );
+    }
+
+    #[test]
+    fn halfka_starting_position() {
+        let board = Board::starting_position();
+        let features = board.halfka().expect("halfka should succeed");
+
+        assert_eq!(features.len(), 64 * 12 * 64);
+        let ones = features.iter().filter(|&&v| v == 1.0).count();
+        assert_eq!(
+            ones, 32,
+            "starting position should have 32 feature activations"
+        );
+
+        let king_sq = (0_u8, 4_u8); // e1
+        let idx = |piece_sq: (u8, u8), kind: PieceKind, friendly: bool| -> usize {
+            let king_index = king_sq.0 as usize * 8 + king_sq.1 as usize;
+            let plane_offset = king_index * (12 * 64);
+            let square_index = piece_sq.0 as usize * 8 + piece_sq.1 as usize;
+            let kind_index = kind as usize + if friendly { 0 } else { 6 };
+            plane_offset + kind_index * 64 + square_index
+        };
+
+        // White pawn on a2
+        assert_eq!(features[idx((1, 0), PieceKind::Pawn, true)], 1.0);
+        // Black pawn on a7
+        assert_eq!(features[idx((6, 0), PieceKind::Pawn, false)], 1.0);
+        // White king on e1
+        assert_eq!(features[idx((0, 4), PieceKind::King, true)], 1.0);
+        // Black king on e8
+        assert_eq!(features[idx((7, 4), PieceKind::King, false)], 1.0);
+    }
+
+    #[test]
+    fn halfka_complex_position_1() {
+        let mut board = Board::empty();
+        board.active_color = Color::White;
+        board.set_piece(
+            Square::unchecked(0, 0),
+            Some(Piece::new(Color::White, PieceKind::King)),
+        );
+        board.set_piece(
+            Square::unchecked(0, 1),
+            Some(Piece::new(Color::White, PieceKind::Knight)),
+        );
+        board.set_piece(
+            Square::unchecked(7, 7),
+            Some(Piece::new(Color::Black, PieceKind::Rook)),
+        );
+
+        let features = board.halfka().expect("halfka should succeed");
+        let king_sq = (0_u8, 0_u8); // a1
+        let idx = |piece_sq: (u8, u8), kind: PieceKind, friendly: bool| -> usize {
+            let king_index = king_sq.0 as usize * 8 + king_sq.1 as usize;
+            let plane_offset = king_index * (12 * 64);
+            let square_index = piece_sq.0 as usize * 8 + piece_sq.1 as usize;
+            let kind_index = kind as usize + if friendly { 0 } else { 6 };
+            plane_offset + kind_index * 64 + square_index
+        };
+
+        assert_eq!(features[idx((0, 0), PieceKind::King, true)], 1.0);
+        assert_eq!(features[idx((0, 1), PieceKind::Knight, true)], 1.0);
+        assert_eq!(features[idx((7, 7), PieceKind::Rook, false)], 1.0);
+
+        let ones = features.iter().filter(|&&v| v == 1.0).count();
+        assert_eq!(ones, 3);
+    }
+
+    #[test]
+    fn halfka_complex_position_2() {
+        let mut board = Board::empty();
+        board.active_color = Color::Black;
+        board.set_piece(
+            Square::unchecked(7, 7),
+            Some(Piece::new(Color::Black, PieceKind::King)),
+        );
+        board.set_piece(
+            Square::unchecked(6, 7),
+            Some(Piece::new(Color::Black, PieceKind::Pawn)),
+        );
+        board.set_piece(
+            Square::unchecked(0, 0),
+            Some(Piece::new(Color::White, PieceKind::Bishop)),
+        );
+
+        let features = board.halfka().expect("halfka should succeed");
+
+        let king_sq = (0_u8, 7_u8); // mirrored h8 after flip
+        let idx = |piece_sq: (u8, u8), kind: PieceKind, friendly: bool| -> usize {
+            let king_index = king_sq.0 as usize * 8 + king_sq.1 as usize;
+            let plane_offset = king_index * (12 * 64);
+            let square_index = piece_sq.0 as usize * 8 + piece_sq.1 as usize;
+            let kind_index = kind as usize + if friendly { 0 } else { 6 };
+            plane_offset + kind_index * 64 + square_index
+        };
+
+        // Black king becomes white king on h1 after flip.
+        assert_eq!(features[idx((0, 7), PieceKind::King, true)], 1.0);
+        // Black pawn becomes white pawn on h2 after flip.
+        assert_eq!(features[idx((1, 7), PieceKind::Pawn, true)], 1.0);
+        // White bishop becomes black bishop on a8 after flip.
+        assert_eq!(features[idx((7, 0), PieceKind::Bishop, false)], 1.0);
+
+        let ones = features.iter().filter(|&&v| v == 1.0).count();
+        assert_eq!(ones, 3);
+    }
+
+    #[test]
+    fn halfka_complex_position_3() {
+        let mut board = Board::empty();
+        board.active_color = Color::White;
+        board.set_piece(
+            Square::unchecked(7, 7),
+            Some(Piece::new(Color::Black, PieceKind::King)),
+        );
+
+        assert!(
+            board.halfka().is_err(),
+            "missing active-color king should error"
         );
     }
 }

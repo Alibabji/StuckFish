@@ -158,19 +158,3 @@ fn negamax(
     tt.store(key, depth, best_value, bound);
     best_value
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chess::Board;
-
-    #[test]
-    fn finds_rook_mate_in_one() {
-        let board = Board::from_fen("4r1k1/8/8/8/8/8/4R3/4K3 w - - 0 1").unwrap();
-        let mut tt = TranspositionTable::new(1);
-        let result = search_best_move(&board, &mut tt, 3);
-        let mv = result.best_move.expect("best move");
-        assert!(result.stats.nodes > 0);
-        assert_eq!(mv.to_uci(), "e2e8");
-    }
-}

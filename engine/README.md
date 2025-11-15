@@ -57,6 +57,13 @@ cargo clean
 
 Fetch drive link from https://drive.google.com/file/d/1Z6dAszKEsGk9WBjq3G8wnMyNOcMWOCRu/view?usp=drive_link
 
+### Official Stockfish dataset
+
+If you prefer to start from the upstream Stockfish NNUE dumps, follow
+[`docs/stockfish_dataset.md`](docs/stockfish_dataset.md) for the download and
+sampling steps. It shows how to fetch one of the monthly `.binpack` archives
+from Hugging Face and convert it into a ~10M row CSV that `train_nnue` can read.
+
 ## Usage
 
 ### Training steps

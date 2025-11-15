@@ -43,6 +43,10 @@ struct TrainArgs {
     /// Existing weights file to initialize from (resume training)
     #[arg(long, value_name = "FILE")]
     init_weights: Option<PathBuf>,
+
+    /// Ignore duplicate FENs within each epoch (costs extra RAM)
+    #[arg(long)]
+    dedupe_fens: bool,
 }
 
 fn main() -> Result<()> {
@@ -56,6 +60,7 @@ fn main() -> Result<()> {
     options.log_interval = args.log_interval;
     options.initial_weights = args.init_weights.clone();
     options.seed = args.seed;
+    options.dedupe_fens = args.dedupe_fens;
 
     fs::create_dir_all(
         args.output
