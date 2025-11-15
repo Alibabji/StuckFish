@@ -4,6 +4,7 @@ import random
 import time, os, subprocess
 
 os.system('./scripts/setup.sh')
+while not os.path.isdir("libtorch"): time.sleep(0.1)
 engine = subprocess.Popen(
     ['./suckfish', '--nnue-path', 'nnue.ot'],
     stdin=subprocess.PIPE,

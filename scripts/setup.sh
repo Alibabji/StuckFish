@@ -44,8 +44,3 @@ fi
 export LIBTORCH="$(pwd)/libtorch"
 export PATH="$LIBTORCH/bin${PATH:+:${PATH}}"
 export LD_LIBRARY_PATH="$LIBTORCH/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-
-cd engine
-cargo build --release --bin suckfish
-cp target/release/suckfish ../
-cd ..
