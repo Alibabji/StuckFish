@@ -3,8 +3,9 @@ from chess import Move
 import random
 import time, os, subprocess
 
-os.system('./scripts/setup.sh')
-while not os.path.isdir("libtorch"): time.sleep(0.1)
+# Ensure runtime dependencies exist before launching the engine.
+if not os.path.isdir("libtorch"):
+    raise RuntimeError("Missing libtorch directory; run scripts/setup.sh during build")
 engine = subprocess.Popen(
     ['./suckfish', '--nnue-path', 'nnue.ot'],
     stdin=subprocess.PIPE,
