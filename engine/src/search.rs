@@ -1,4 +1,4 @@
-use crate::chess::{Board, Move, PieceKind};
+use crate::chess::{Board, Move, MoveList, PieceKind};
 use crate::nnue::NnueRunner;
 use crate::tt::{Bound, TranspositionTable};
 use std::time::{Duration, Instant};
@@ -108,7 +108,7 @@ pub fn search_best_move(
     nnue_runner: &NnueRunner,
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
-    let mut root_moves = Vec::new();
+    let mut root_moves = MoveList::new();
     board.legal_moves_into(&mut root_moves);
     if root_moves.is_empty() {
         return SearchReport {
@@ -187,7 +187,7 @@ fn search_single_depth(
     board: &mut Board,
     tt: &mut TranspositionTable,
     depth: u8,
-    root_moves: &mut Vec<Move>,
+    root_moves: &mut MoveList,
     preferred: Option<Move>,
     alpha: i32,
     beta: i32,
@@ -290,7 +290,7 @@ fn negamax(
         }
     }
 
-    let mut moves = Vec::new();
+    let mut moves = MoveList::new();
     board.legal_moves_into(&mut moves);
     let killers = state.killer_moves(ply);
     order_moves(board, &mut moves, None, tt_move, killers, state);
@@ -304,7 +304,7 @@ fn negamax(
 
     let mut best_value = -MATE_VALUE;
     let mut best_move = None;
-    for mv in moves {
+    for &mv in moves.as_slice() {
         let undo = board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
         let score = -negamax(
@@ -367,13 +367,13 @@ fn quiescence(
         alpha = stand_pat;
     }
 
-    let mut moves = Vec::new();
+    let mut moves = MoveList::new();
     board.legal_moves_into(&mut moves);
     let tt_move = tt.probe(board.hash()).and_then(|entry| entry.best_move);
     let killers = state.killer_moves(ply);
     order_moves(board, &mut moves, None, tt_move, killers, state);
 
-    for mv in moves {
+    for &mv in moves.as_slice() {
         if board.piece_at(mv.to).is_none() {
             continue;
         }
@@ -393,16 +393,17 @@ fn quiescence(
 
 fn order_moves(
     board: &Board,
-    moves: &mut [Move],
+    moves: &mut MoveList,
     preferred: Option<Move>,
     tt_move: Option<Move>,
     killer_moves: [Option<Move>; 2],
     state: &SearchState,
 ) {
-    moves.sort_by_key(|mv| {
+    let slice = moves.as_mut_slice();
+    slice.sort_by_key(|mv| {
         move_score(board, *mv, preferred, tt_move, killer_moves, state)
     });
-    moves.reverse();
+    slice.reverse();
 }
 
 fn move_score(

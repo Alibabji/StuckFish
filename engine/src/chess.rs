@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::OnceLock;
 
 type Bitboard = u64;
+const MAX_MOVES: usize = 256;
 
 fn rank_mask(rank: u8) -> Bitboard {
     0xFF_u64 << (rank as usize * 8)
@@ -86,6 +87,17 @@ impl From<usize> for PieceKind {
 impl PieceKind {
     fn idx(self) -> usize {
         self as usize
+    }
+
+    fn all() -> [PieceKind; 6] {
+        [
+            PieceKind::Pawn,
+            PieceKind::Knight,
+            PieceKind::Bishop,
+            PieceKind::Rook,
+            PieceKind::Queen,
+            PieceKind::King,
+        ]
     }
 }
 
@@ -425,6 +437,13 @@ impl Move {
     pub fn to_uci(self) -> String {
         format!("{}{}", self.from.to_algebraic(), self.to.to_algebraic())
     }
+
+    pub const fn empty() -> Self {
+        Self {
+            from: Square::unchecked(0, 0),
+            to: Square::unchecked(0, 0),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -531,6 +550,56 @@ impl CastlingRights {
 }
 
 #[derive(Clone)]
+pub struct MoveList {
+    data: [Move; MAX_MOVES],
+    len: usize,
+}
+
+impl MoveList {
+    pub fn new() -> Self {
+        Self {
+            data: [Move::empty(); MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, mv: Move) {
+        if self.len < MAX_MOVES {
+            self.data[self.len] = mv;
+            self.len += 1;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Move> {
+        self.data[..self.len].iter()
+    }
+
+    pub fn as_slice(&self) -> &[Move] {
+        &self.data[..self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [Move] {
+        &mut self.data[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn contains(&self, mv: &Move) -> bool {
+        self.as_slice().contains(mv)
+    }
+}
+
+#[derive(Clone)]
 struct NnueAccumulator {
     perspective: Color,
     king_square: Option<Square>,
@@ -560,14 +629,7 @@ impl NnueAccumulator {
             return;
         }
         for color in [Color::White, Color::Black] {
-            for kind in [
-                PieceKind::Pawn,
-                PieceKind::Knight,
-                PieceKind::Bishop,
-                PieceKind::Rook,
-                PieceKind::Queen,
-                PieceKind::King,
-            ] {
+            for kind in PieceKind::all() {
                 let mut bb = board.piece_bitboards[color.idx()][kind.idx()];
                 while bb != 0 {
                     let idx = bb.trailing_zeros() as u8;
@@ -1078,34 +1140,28 @@ impl Board {
         }
     }
 
-    pub fn legal_moves_into(&mut self, moves: &mut Vec<Move>) {
-        let mut pseudo = Vec::new();
-        self.pseudo_legal_moves_into(&mut pseudo);
-        moves.clear();
-        for mv in pseudo {
-            if self.move_is_legal_mut(mv) {
-                moves.push(mv);
-            }
-        }
-    }
-
-    fn pseudo_legal_moves_into(&self, moves: &mut Vec<Move>) {
-        moves.clear();
+    pub fn legal_moves_into(&mut self, buffer: &mut MoveList) {
+        buffer.clear();
         let color = self.active_color;
-        for kind in [
-            PieceKind::Pawn,
-            PieceKind::Knight,
-            PieceKind::Bishop,
-            PieceKind::Rook,
-            PieceKind::Queen,
-            PieceKind::King,
-        ] {
+        let mut pseudo = MoveList::new();
+
+        for kind in PieceKind::all() {
             let mut bb = self.piece_bitboards[color.idx()][kind.idx()];
             while bb != 0 {
                 let idx = bb.trailing_zeros() as u8;
                 bb &= bb - 1;
                 let square = Square::from_index(idx);
-                self.generate_moves_for_piece(square, Piece::new(color, kind), moves);
+                self.generate_moves_for_piece(
+                    square,
+                    Piece::new(color, kind),
+                    &mut pseudo,
+                );
+            }
+        }
+
+        for mv in pseudo.iter() {
+            if self.move_is_legal_mut(*mv) {
+                buffer.push(*mv);
             }
         }
     }
@@ -1114,23 +1170,23 @@ impl Board {
         &self,
         square: Square,
         piece: Piece,
-        moves: &mut Vec<Move>,
+        buffer: &mut MoveList,
     ) {
         match piece.kind {
-            PieceKind::Pawn => self.generate_pawn_moves(square, piece.color, moves),
+            PieceKind::Pawn => self.generate_pawn_moves(square, piece.color, buffer),
             PieceKind::Knight => {
-                self.generate_knight_moves(square, piece.color, moves)
+                self.generate_knight_moves(square, piece.color, buffer)
             }
             PieceKind::Bishop => {
-                self.generate_sliding_moves(square, piece.color, moves, &BISHOP_DIRS)
+                self.generate_sliding_moves(square, piece.color, buffer, &BISHOP_DIRS)
             }
             PieceKind::Rook => {
-                self.generate_sliding_moves(square, piece.color, moves, &ROOK_DIRS)
+                self.generate_sliding_moves(square, piece.color, buffer, &ROOK_DIRS)
             }
             PieceKind::Queen => self.generate_sliding_moves(
                 square,
                 piece.color,
-                moves,
+                buffer,
                 &[
                     (1, 0),
                     (-1, 0),
@@ -1142,7 +1198,7 @@ impl Board {
                     (-1, -1),
                 ],
             ),
-            PieceKind::King => self.generate_king_moves(square, piece.color, moves),
+            PieceKind::King => self.generate_king_moves(square, piece.color, buffer),
         }
     }
 
@@ -1150,7 +1206,7 @@ impl Board {
         &self,
         square: Square,
         color: Color,
-        moves: &mut Vec<Move>,
+        buffer: &mut MoveList,
     ) {
         let dir: i8 = match color {
             Color::White => 1,
@@ -1159,7 +1215,7 @@ impl Board {
         if let Some(one_step) = square.offset(dir, 0) {
             let mask = square_bitboard(one_step);
             if self.occupancy & mask == 0 {
-                moves.push(Move::new(square, one_step));
+                buffer.push(Move::new(square, one_step));
                 let start_rank = match color {
                     Color::White => 1,
                     Color::Black => 6,
@@ -1168,7 +1224,7 @@ impl Board {
                     if let Some(two_step) = square.offset(dir * 2, 0) {
                         let two_mask = square_bitboard(two_step);
                         if self.occupancy & two_mask == 0 {
-                            moves.push(Move::new(square, two_step));
+                            buffer.push(Move::new(square, two_step));
                         }
                     }
                 }
@@ -1180,7 +1236,7 @@ impl Board {
             if let Some(target) = square.offset(dir, df) {
                 let mask = square_bitboard(target);
                 if enemy_occ & mask != 0 {
-                    moves.push(Move::new(square, target));
+                    buffer.push(Move::new(square, target));
                 }
             }
         }
@@ -1190,32 +1246,32 @@ impl Board {
         &self,
         square: Square,
         color: Color,
-        moves: &mut Vec<Move>,
+        buffer: &mut MoveList,
     ) {
         let attacks = knight_attacks(square) & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
+        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
     }
 
     fn generate_sliding_moves(
         &self,
         square: Square,
         color: Color,
-        moves: &mut Vec<Move>,
+        buffer: &mut MoveList,
         directions: &[(i8, i8)],
     ) {
         let attacks = sliding_attacks_from(square, self.occupancy, directions)
             & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
+        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
     }
 
     fn generate_king_moves(
         &self,
         square: Square,
         color: Color,
-        moves: &mut Vec<Move>,
+        buffer: &mut MoveList,
     ) {
         let attacks = king_attacks(square) & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
+        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
     }
 
     fn move_is_legal(&self, mv: Move) -> bool {
@@ -1583,7 +1639,7 @@ mod tests {
     #[test]
     fn starting_position_has_twenty_legal_moves() {
         let mut board = Board::starting_position();
-        let mut moves = Vec::new();
+        let mut moves = MoveList::new();
         board.legal_moves_into(&mut moves);
         assert_eq!(moves.len(), 20);
     }
@@ -1609,7 +1665,7 @@ mod tests {
             Some(Piece::new(Color::Black, PieceKind::Rook)),
         );
 
-        let mut moves = Vec::new();
+        let mut moves = MoveList::new();
         board.legal_moves_into(&mut moves);
         let illegal = Move::new(Square::unchecked(6, 4), Square::unchecked(6, 5));
         assert!(
