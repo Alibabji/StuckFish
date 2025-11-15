@@ -15,20 +15,23 @@ pub struct SearchStatistics {
 struct SearchState {
     killer_moves: [[Option<Move>; 2]; MAX_PLY],
     history: [[u32; 64]; 64],
+    deadline: Option<Instant>,
+    stopped: bool,
 }
 
 fn move_indices(mv: Move) -> (usize, usize) {
-    let from =
-        mv.from.rank() as usize * 8 + mv.from.file() as usize;
+    let from = mv.from.rank() as usize * 8 + mv.from.file() as usize;
     let to = mv.to.rank() as usize * 8 + mv.to.file() as usize;
     (from, to)
 }
 
 impl SearchState {
-    fn new() -> Self {
+    fn new(deadline: Option<Instant>) -> Self {
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
+            deadline,
+            stopped: false,
         }
     }
 
@@ -56,6 +59,19 @@ impl SearchState {
     fn history_score(&self, mv: Move) -> i32 {
         let (from, to) = move_indices(mv);
         self.history[from][to] as i32
+    }
+
+    fn should_stop(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                self.stopped = true;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -85,61 +101,78 @@ impl SearchReport {
 }
 
 pub fn search_best_move(
-    board: &Board,
+    board: &mut Board,
     tt: &mut TranspositionTable,
-    depth: u8,
+    max_depth: u8,
+    time_budget: Option<Duration>,
     nnue_runner: &NnueRunner,
 ) -> SearchReport {
-    let root_moves = board.legal_moves();
     let mut stats = SearchStatistics::default();
-    let mut state = SearchState::new();
+    let mut root_moves = Vec::new();
+    board.legal_moves_into(&mut root_moves);
     if root_moves.is_empty() {
         return SearchReport {
             best_move: None,
-            depth,
+            depth: 0,
             stats: SearchStatistics::default(),
             elapsed: Duration::from_millis(0),
         };
     }
 
     let start = Instant::now();
-    if depth == 0 {
-        let (best_move, _) = search_single_depth(
-            board,
-            tt,
-            depth,
-            &root_moves,
-            None,
-            &mut stats,
-            &mut state,
-            nnue_runner,
-        );
-        return SearchReport {
-            best_move,
-            depth: 0,
-            stats,
-            elapsed: start.elapsed(),
-        };
-    }
+    let deadline = time_budget.map(|budget| start + budget);
+    let mut state = SearchState::new(deadline);
 
     let mut best_move = None;
     let mut completed_depth = 0;
-    for current_depth in 1..=depth {
-        let (candidate_move, _) = search_single_depth(
-            board,
-            tt,
-            current_depth,
-            &root_moves,
-            best_move,
-            &mut stats,
-            &mut state,
-            nnue_runner,
-        );
-        if candidate_move.is_none() {
+    let mut last_score = 0;
+    const ASP_WINDOW: i32 = 50;
+
+    'search: for current_depth in 1..=max_depth {
+        if state.should_stop() {
             break;
         }
-        best_move = candidate_move;
-        completed_depth = current_depth;
+        let mut alpha = if current_depth > 1 {
+            (last_score - ASP_WINDOW).max(-MATE_VALUE)
+        } else {
+            -MATE_VALUE
+        };
+        let mut beta = if current_depth > 1 {
+            (last_score + ASP_WINDOW).min(MATE_VALUE)
+        } else {
+            MATE_VALUE
+        };
+
+        loop {
+            let (candidate_move, score) = search_single_depth(
+                board,
+                tt,
+                current_depth,
+                &mut root_moves,
+                best_move,
+                alpha,
+                beta,
+                &mut stats,
+                &mut state,
+                nnue_runner,
+            );
+            if state.should_stop() {
+                break 'search;
+            }
+
+            if score <= alpha && alpha > -MATE_VALUE {
+                alpha = alpha.saturating_sub(ASP_WINDOW * 2);
+                continue;
+            } else if score >= beta && beta < MATE_VALUE {
+                beta = beta.saturating_add(ASP_WINDOW * 2);
+                continue;
+            } else {
+                best_move = candidate_move;
+                last_score = score;
+                completed_depth = current_depth;
+                break;
+            }
+        }
     }
 
     SearchReport {
@@ -151,45 +184,45 @@ pub fn search_best_move(
 }
 
 fn search_single_depth(
-    board: &Board,
+    board: &mut Board,
     tt: &mut TranspositionTable,
     depth: u8,
-    root_moves: &[Move],
+    root_moves: &mut Vec<Move>,
     preferred: Option<Move>,
+    alpha: i32,
+    beta: i32,
     stats: &mut SearchStatistics,
     state: &mut SearchState,
     nnue_runner: &NnueRunner,
 ) -> (Option<Move>, i32) {
-    let mut moves = root_moves.to_vec();
     let tt_move = tt.probe(board.hash()).and_then(|entry| entry.best_move);
     let killers = state.killer_moves(0);
-    order_moves(board, &mut moves, preferred, tt_move, killers, state);
+    order_moves(board, root_moves, preferred, tt_move, killers, state);
 
     let mut best_move = None;
     let mut best_score = -MATE_VALUE;
-    let mut alpha = -MATE_VALUE;
-    let beta = MATE_VALUE;
+    let mut alpha_bound = alpha;
 
-    for mv in moves {
-        let mut next = board.clone();
-        next.apply_move_unchecked(mv);
+    for &mv in root_moves.iter() {
+        let undo = board.make_move(mv);
         let score = -negamax(
-            &next,
+            board,
             tt,
             depth.saturating_sub(1),
             -beta,
-            -alpha,
+            -alpha_bound,
             stats,
             state,
             1,
             nnue_runner,
         );
+        board.unmake_move(undo);
         if score > best_score {
             best_score = score;
             best_move = Some(mv);
         }
-        alpha = alpha.max(best_score);
-        if alpha >= beta {
+        alpha_bound = alpha_bound.max(best_score);
+        if alpha_bound >= beta {
             break;
         }
     }
@@ -198,7 +231,7 @@ fn search_single_depth(
 }
 
 fn negamax(
-    board: &Board,
+    board: &mut Board,
     tt: &mut TranspositionTable,
     depth: u8,
     mut alpha: i32,
@@ -208,6 +241,9 @@ fn negamax(
     ply: usize,
     nnue_runner: &NnueRunner,
 ) -> i32 {
+    if state.should_stop() {
+        return 0;
+    }
     stats.record_node();
 
     let alpha_orig = alpha;
@@ -230,12 +266,32 @@ fn negamax(
     }
 
     if depth == 0 {
-        let eval = nnue_runner.eval(board).unwrap_or(-MATE_VALUE);
-        tt.store(key, depth, eval, Bound::Exact, None);
+        let eval = quiescence(board, tt, alpha, beta, stats, state, ply, nnue_runner);
         return eval;
     }
 
-    let mut moves = board.legal_moves();
+    const NULL_MOVE_REDUCTION: u8 = 2;
+    if depth > NULL_MOVE_REDUCTION + 1 && !board.is_in_check(board.active_color) {
+        let undo = board.make_null_move();
+        let score = -negamax(
+            board,
+            tt,
+            depth - 1 - NULL_MOVE_REDUCTION,
+            -beta,
+            -beta + 1,
+            stats,
+            state,
+            ply + 1,
+            nnue_runner,
+        );
+        board.unmake_null_move(undo);
+        if score >= beta {
+            return score;
+        }
+    }
+
+    let mut moves = Vec::new();
+    board.legal_moves_into(&mut moves);
     let killers = state.killer_moves(ply);
     order_moves(board, &mut moves, None, tt_move, killers, state);
     if moves.is_empty() {
@@ -249,11 +305,10 @@ fn negamax(
     let mut best_value = -MATE_VALUE;
     let mut best_move = None;
     for mv in moves {
-        let is_capture = board.piece_at(mv.to).is_some();
-        let mut child = board.clone();
-        child.apply_move_unchecked(mv);
+        let undo = board.make_move(mv);
+        let is_capture = undo.captured_piece.is_some();
         let score = -negamax(
-            &child,
+            board,
             tt,
             depth.saturating_sub(1),
             -beta,
@@ -263,6 +318,7 @@ fn negamax(
             ply + 1,
             nnue_runner,
         );
+        board.unmake_move(undo);
         if score > best_value {
             best_value = score;
             best_move = Some(mv);
@@ -288,6 +344,53 @@ fn negamax(
     best_value
 }
 
+fn quiescence(
+    board: &mut Board,
+    tt: &mut TranspositionTable,
+    mut alpha: i32,
+    beta: i32,
+    stats: &mut SearchStatistics,
+    state: &mut SearchState,
+    ply: usize,
+    nnue_runner: &NnueRunner,
+) -> i32 {
+    if state.should_stop() {
+        return alpha;
+    }
+    stats.record_node();
+
+    let stand_pat = nnue_runner.eval(board).unwrap_or(-MATE_VALUE);
+    if stand_pat >= beta {
+        return stand_pat;
+    }
+    if alpha < stand_pat {
+        alpha = stand_pat;
+    }
+
+    let mut moves = Vec::new();
+    board.legal_moves_into(&mut moves);
+    let tt_move = tt.probe(board.hash()).and_then(|entry| entry.best_move);
+    let killers = state.killer_moves(ply);
+    order_moves(board, &mut moves, None, tt_move, killers, state);
+
+    for mv in moves {
+        if board.piece_at(mv.to).is_none() {
+            continue;
+        }
+        let undo = board.make_move(mv);
+        let score =
+            -quiescence(board, tt, -beta, -alpha, stats, state, ply + 1, nnue_runner);
+        board.unmake_move(undo);
+
+        if score >= beta {
+            return beta;
+        }
+        alpha = alpha.max(score);
+    }
+
+    alpha
+}
+
 fn order_moves(
     board: &Board,
     moves: &mut [Move],
@@ -296,7 +399,9 @@ fn order_moves(
     killer_moves: [Option<Move>; 2],
     state: &SearchState,
 ) {
-    moves.sort_by_key(|mv| move_score(board, *mv, preferred, tt_move, killer_moves, state));
+    moves.sort_by_key(|mv| {
+        move_score(board, *mv, preferred, tt_move, killer_moves, state)
+    });
     moves.reverse();
 }
 
@@ -335,11 +440,13 @@ fn move_score(
     }
 
     if let Some(moving) = board.piece_at(mv.from) {
-        if moving.kind == PieceKind::Pawn && (mv.to.rank() == 0 || mv.to.rank() == 7) {
+        if moving.kind == PieceKind::Pawn && (mv.to.rank() == 0 || mv.to.rank() == 7)
+        {
             score += PROMOTION_BONUS;
         }
         if let Some(captured) = board.piece_at(mv.to) {
-            score += CAPTURE_BONUS + piece_value(captured.kind) - piece_value(moving.kind);
+            score +=
+                CAPTURE_BONUS + piece_value(captured.kind) - piece_value(moving.kind);
         }
     }
 

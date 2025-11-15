@@ -244,9 +244,7 @@ impl SplitMix64 {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_add(0x9E37_79B9_7F4A_7C15_u64);
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15_u64);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -268,6 +266,26 @@ impl Move {
     pub fn to_uci(self) -> String {
         format!("{}{}", self.from.to_algebraic(), self.to.to_algebraic())
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct MoveUndo {
+    pub(crate) mv: Move,
+    pub(crate) moving_piece: Piece,
+    pub(crate) captured_piece: Option<Piece>,
+    pub(crate) prev_castling_rights: CastlingRights,
+    pub(crate) prev_en_passant: Option<Square>,
+    pub(crate) prev_halfmove_clock: u32,
+    pub(crate) prev_fullmove_number: u32,
+    pub(crate) prev_active_color: Color,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct NullMoveUndo {
+    prev_en_passant: Option<Square>,
+    prev_halfmove_clock: u32,
+    prev_fullmove_number: u32,
+    prev_active_color: Color,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
@@ -485,7 +503,7 @@ impl Board {
 
     pub fn play_move(&mut self, mv: Move) -> bool {
         if self.move_is_legal(mv) {
-            self.apply_move_unchecked(mv);
+            self.make_move(mv);
             true
         } else {
             false
@@ -724,13 +742,19 @@ impl Board {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
+        let mut clone = self.clone();
         let mut moves = Vec::new();
+        clone.legal_moves_into(&mut moves);
+        moves
+    }
+
+    pub fn legal_moves_into(&mut self, moves: &mut Vec<Move>) {
+        moves.clear();
         for mv in self.pseudo_legal_moves() {
-            if self.move_is_legal(mv) {
+            if self.move_is_legal_mut(mv) {
                 moves.push(mv);
             }
         }
-        moves
     }
 
     fn pseudo_legal_moves(&self) -> Vec<Move> {
@@ -906,6 +930,11 @@ impl Board {
     }
 
     fn move_is_legal(&self, mv: Move) -> bool {
+        let mut clone = self.clone();
+        clone.move_is_legal_mut(mv)
+    }
+
+    fn move_is_legal_mut(&mut self, mv: Move) -> bool {
         let piece = match self.piece_at(mv.from) {
             Some(piece) => piece,
             None => return false,
@@ -921,14 +950,29 @@ impl Board {
             return false;
         }
 
-        let mut next = self.clone();
-        next.apply_move_unchecked(mv);
-        !next.is_in_check(self.active_color)
+        let undo = self.make_move_internal(mv, piece);
+        let legal = !self.is_in_check(self.active_color.opponent());
+        self.unmake_move(undo);
+        legal
     }
 
-    pub(crate) fn apply_move_unchecked(&mut self, mv: Move) {
+    pub(crate) fn make_move(&mut self, mv: Move) -> MoveUndo {
         let piece = self.piece_at(mv.from).expect("move must have a piece");
+        self.make_move_internal(mv, piece)
+    }
+
+    fn make_move_internal(&mut self, mv: Move, piece: Piece) -> MoveUndo {
         let captured = self.piece_at(mv.to);
+        let undo = MoveUndo {
+            mv,
+            moving_piece: piece,
+            captured_piece: captured,
+            prev_castling_rights: self.castling_rights,
+            prev_en_passant: self.en_passant,
+            prev_halfmove_clock: self.halfmove_clock,
+            prev_fullmove_number: self.fullmove_number,
+            prev_active_color: self.active_color,
+        };
 
         self.update_castling_after_move(mv, piece, captured);
 
@@ -955,6 +999,41 @@ impl Board {
         }
 
         self.toggle_active_color();
+        undo
+    }
+
+    pub(crate) fn unmake_move(&mut self, undo: MoveUndo) {
+        self.set_active_color(undo.prev_active_color);
+        self.fullmove_number = undo.prev_fullmove_number;
+        self.halfmove_clock = undo.prev_halfmove_clock;
+        self.set_castling_rights(undo.prev_castling_rights);
+        self.set_en_passant(undo.prev_en_passant);
+
+        self.set_piece(undo.mv.to, undo.captured_piece);
+        self.set_piece(undo.mv.from, Some(undo.moving_piece));
+    }
+
+    pub(crate) fn make_null_move(&mut self) -> NullMoveUndo {
+        let undo = NullMoveUndo {
+            prev_en_passant: self.en_passant,
+            prev_halfmove_clock: self.halfmove_clock,
+            prev_fullmove_number: self.fullmove_number,
+            prev_active_color: self.active_color,
+        };
+        self.set_en_passant(None);
+        self.halfmove_clock = self.halfmove_clock.saturating_add(1);
+        if self.active_color == Color::Black {
+            self.fullmove_number = self.fullmove_number.saturating_add(1);
+        }
+        self.toggle_active_color();
+        undo
+    }
+
+    pub(crate) fn unmake_null_move(&mut self, undo: NullMoveUndo) {
+        self.set_active_color(undo.prev_active_color);
+        self.fullmove_number = undo.prev_fullmove_number;
+        self.halfmove_clock = undo.prev_halfmove_clock;
+        self.set_en_passant(undo.prev_en_passant);
     }
 
     fn update_castling_after_move(
