@@ -1,5 +1,5 @@
 use crate::chess::{Board, Move, MoveList, PieceKind};
-use crate::nnue::NnueRunner;
+use crate::nnue_runtime::NnueRuntime;
 use crate::tt::{Bound, TranspositionTable};
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,7 @@ pub fn search_best_move(
     tt: &mut TranspositionTable,
     max_depth: u8,
     time_budget: Option<Duration>,
-    nnue_runner: &NnueRunner,
+    nnue_runner: &NnueRuntime,
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
@@ -193,7 +193,7 @@ fn search_single_depth(
     beta: i32,
     stats: &mut SearchStatistics,
     state: &mut SearchState,
-    nnue_runner: &NnueRunner,
+    nnue_runner: &NnueRuntime,
 ) -> (Option<Move>, i32) {
     let tt_move = tt.probe(board.hash()).and_then(|entry| entry.best_move);
     let killers = state.killer_moves(0);
@@ -239,7 +239,7 @@ fn negamax(
     stats: &mut SearchStatistics,
     state: &mut SearchState,
     ply: usize,
-    nnue_runner: &NnueRunner,
+    nnue_runner: &NnueRuntime,
 ) -> i32 {
     if state.should_stop() {
         return 0;
@@ -352,7 +352,7 @@ fn quiescence(
     stats: &mut SearchStatistics,
     state: &mut SearchState,
     ply: usize,
-    nnue_runner: &NnueRunner,
+    nnue_runner: &NnueRuntime,
 ) -> i32 {
     if state.should_stop() {
         return alpha;

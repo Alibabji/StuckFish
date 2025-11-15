@@ -15,7 +15,7 @@ use tch::{Device, Kind, Reduction, Tensor, nn};
 const HALF_KA_DIM: i64 = 64 * 12 * 64;
 const DEFAULT_FEATURE_DIM: i64 = 256;
 const DEFAULT_HIDDEN_DIM: i64 = 32;
-const CLIPPED_RELU_CAP: f64 = 127.0;
+pub(crate) const CLIPPED_RELU_CAP: f64 = 127.0;
 const TARGET_CP_CLIP: f32 = 2000.0;
 
 #[derive(Clone, Copy)]
@@ -408,16 +408,16 @@ struct Sample {
     target: f32,
 }
 
-struct NnueLayers {
-    view_feat: SparseAccumulator,
-    hidden0: nn::Linear,
-    hidden1: nn::Linear,
-    output: nn::Linear,
-    config: NnueConfig,
+pub(crate) struct NnueLayers {
+    pub(crate) view_feat: SparseAccumulator,
+    pub(crate) hidden0: nn::Linear,
+    pub(crate) hidden1: nn::Linear,
+    pub(crate) output: nn::Linear,
+    pub(crate) config: NnueConfig,
 }
 
 impl NnueLayers {
-    fn new(path: &nn::Path, config: &NnueConfig) -> Self {
+    pub(crate) fn new(path: &nn::Path, config: &NnueConfig) -> Self {
         let linear_cfg = nn::LinearConfig {
             bias: true,
             ..Default::default()
@@ -477,9 +477,9 @@ impl NnueLayers {
     }
 }
 
-struct SparseAccumulator {
-    weights: Tensor,
-    bias: Tensor,
+pub(crate) struct SparseAccumulator {
+    pub(crate) weights: Tensor,
+    pub(crate) bias: Tensor,
 }
 
 impl SparseAccumulator {

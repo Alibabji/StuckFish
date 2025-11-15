@@ -1,5 +1,5 @@
 use suckfish::chess::Board;
-use suckfish::nnue::NnueRunner;
+use suckfish::nnue_runtime::NnueRuntime;
 use suckfish::search::search_best_move;
 use suckfish::tt::TranspositionTable;
 
@@ -7,7 +7,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
-use tch::Device;
 
 #[derive(Parser, Debug)]
 #[command(about = "Suckfish: a homemade chess engine", author, version)]
@@ -19,8 +18,7 @@ struct CmdArgs {
 
 fn main() -> Result<()> {
     let cmd_args = CmdArgs::parse();
-    let nnue_runner =
-        NnueRunner::new(cmd_args.nnue_path, Device::cuda_if_available())?;
+    let nnue_runner = NnueRuntime::new(cmd_args.nnue_path)?;
     let mut tt = TranspositionTable::new(16);
     loop {
         let mut cmdline = String::new();
