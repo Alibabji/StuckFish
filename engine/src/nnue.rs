@@ -101,8 +101,11 @@ impl NnueRunner {
 
     /// Evaluate a board using NNUE
     pub fn eval(&self, board: &Board) -> Result<i32> {
-        let features = self.feature_indices_from_board(board)?;
-        let feat_refs = vec![features.as_slice()];
+        let indices = board.nnue_active_indices();
+        if indices.is_empty() {
+            return Err(anyhow!("NNUE state missing active indices"));
+        }
+        let feat_refs = vec![indices];
         let output = self
             .network
             .forward_sparse(&feat_refs, self.device)
@@ -112,8 +115,7 @@ impl NnueRunner {
     }
 
     pub fn feature_indices_from_board(&self, board: &Board) -> Result<Vec<i64>> {
-        let features = board.halfka()?;
-        Ok(active_indices(&features))
+        Ok(board.nnue_active_indices().to_vec())
     }
 }
 
@@ -323,20 +325,6 @@ fn parse_sample(
     };
 
     Some((Sample { features, target }, board_hash))
-}
-
-fn active_indices(features: &[f32]) -> Vec<i64> {
-    features
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, value)| {
-            if *value != 0.0 {
-                Some(idx as i64)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn train_batch(

@@ -2,6 +2,12 @@ use anyhow::{Error as E, Result};
 use std::fmt;
 use std::sync::OnceLock;
 
+type Bitboard = u64;
+
+fn rank_mask(rank: u8) -> Bitboard {
+    0xFF_u64 << (rank as usize * 8)
+}
+
 #[derive(Debug, Clone)]
 pub struct FenError(String);
 
@@ -42,6 +48,14 @@ impl Color {
 
     fn idx(self) -> usize {
         self as usize
+    }
+
+    fn from_idx(idx: usize) -> Self {
+        match idx {
+            0 => Color::White,
+            1 => Color::Black,
+            _ => panic!("invalid color idx {idx}"),
+        }
     }
 }
 
@@ -101,13 +115,6 @@ impl Piece {
             Color::Black => symbol,
         }
     }
-
-    fn betray(&self) -> Self {
-        Self {
-            color: self.color.opponent(),
-            kind: self.kind,
-        }
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -137,12 +144,14 @@ impl Square {
         self.file
     }
 
-    fn to_indices(self) -> (usize, usize) {
-        (self.rank as usize, self.file as usize)
-    }
-
     fn to_index(self) -> usize {
         self.rank as usize * 8 + self.file as usize
+    }
+
+    pub fn from_index(idx: u8) -> Self {
+        let rank = idx / 8;
+        let file = idx % 8;
+        Square::unchecked(rank, file)
     }
 
     pub fn to_algebraic(self) -> String {
@@ -187,6 +196,156 @@ impl fmt::Display for Square {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_algebraic())
     }
+}
+
+fn square_bitboard(square: Square) -> Bitboard {
+    1u64 << square.to_index()
+}
+
+fn for_each_bit(mut bb: Bitboard, mut f: impl FnMut(Square)) {
+    while bb != 0 {
+        let idx = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(Square::from_index(idx));
+    }
+}
+
+fn orient_square(square: Square, perspective: Color) -> Square {
+    if perspective == Color::White {
+        square
+    } else {
+        Square::unchecked(7 - square.rank(), square.file())
+    }
+}
+
+fn orient_color(color: Color, perspective: Color) -> Color {
+    if perspective == Color::White {
+        color
+    } else {
+        color.opponent()
+    }
+}
+
+const KNIGHT_DELTAS: [(i8, i8); 8] = [
+    (1, 2),
+    (2, 1),
+    (2, -1),
+    (1, -2),
+    (-1, -2),
+    (-2, -1),
+    (-2, 1),
+    (-1, 2),
+];
+
+const KING_DELTAS: [(i8, i8); 8] = [
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+];
+
+const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+fn knight_masks() -> &'static [Bitboard; 64] {
+    static KNIGHT: OnceLock<[Bitboard; 64]> = OnceLock::new();
+    KNIGHT.get_or_init(|| {
+        let mut table = [0_u64; 64];
+        for idx in 0..64 {
+            let sq = Square::from_index(idx as u8);
+            let mut mask = 0;
+            for (dr, df) in KNIGHT_DELTAS {
+                if let Some(target) = sq.offset(dr as i8, df as i8) {
+                    mask |= square_bitboard(target);
+                }
+            }
+            table[idx] = mask;
+        }
+        table
+    })
+}
+
+fn king_masks() -> &'static [Bitboard; 64] {
+    static KING: OnceLock<[Bitboard; 64]> = OnceLock::new();
+    KING.get_or_init(|| {
+        let mut table = [0_u64; 64];
+        for idx in 0..64 {
+            let sq = Square::from_index(idx as u8);
+            let mut mask = 0;
+            for (dr, df) in KING_DELTAS {
+                if let Some(target) = sq.offset(dr, df) {
+                    mask |= square_bitboard(target);
+                }
+            }
+            table[idx] = mask;
+        }
+        table
+    })
+}
+
+fn pawn_attack_masks() -> &'static [[Bitboard; 64]; 2] {
+    static MASKS: OnceLock<[[Bitboard; 64]; 2]> = OnceLock::new();
+    MASKS.get_or_init(|| {
+        let mut table = [[0_u64; 64]; 2];
+        for idx in 0..64 {
+            let sq = Square::from_index(idx as u8);
+            let mut white_mask = 0;
+            for df in [-1, 1] {
+                if let Some(target) = sq.offset(1, df) {
+                    white_mask |= square_bitboard(target);
+                }
+            }
+            table[Color::White.idx()][idx] = white_mask;
+
+            let mut black_mask = 0;
+            for df in [-1, 1] {
+                if let Some(target) = sq.offset(-1, df) {
+                    black_mask |= square_bitboard(target);
+                }
+            }
+            table[Color::Black.idx()][idx] = black_mask;
+        }
+        table
+    })
+}
+
+fn knight_attacks(square: Square) -> Bitboard {
+    knight_masks()[square.to_index()]
+}
+
+fn king_attacks(square: Square) -> Bitboard {
+    king_masks()[square.to_index()]
+}
+
+fn pawn_attacks(square: Square, color: Color) -> Bitboard {
+    pawn_attack_masks()[color.idx()][square.to_index()]
+}
+
+fn sliding_attacks_from(
+    square: Square,
+    occupancy: Bitboard,
+    dirs: &[(i8, i8)],
+) -> Bitboard {
+    let mut attacks = 0;
+    for (dr, df) in dirs {
+        let mut rank = square.rank() as i8 + dr;
+        let mut file = square.file() as i8 + df;
+        while (0..=7).contains(&rank) && (0..=7).contains(&file) {
+            let target = Square::unchecked(rank as u8, file as u8);
+            let mask = square_bitboard(target);
+            attacks |= mask;
+            if occupancy & mask != 0 {
+                break;
+            }
+            rank += dr;
+            file += df;
+        }
+    }
+    attacks
 }
 
 fn zobrist_keys() -> &'static ZobristKeys {
@@ -372,8 +531,98 @@ impl CastlingRights {
 }
 
 #[derive(Clone)]
+struct NnueAccumulator {
+    perspective: Color,
+    king_square: Option<Square>,
+    active: Vec<i64>,
+}
+
+impl NnueAccumulator {
+    fn new(perspective: Color) -> Self {
+        Self {
+            perspective,
+            king_square: None,
+            active: Vec::new(),
+        }
+    }
+
+    fn rebuild(&mut self, board: &Board) {
+        self.active.clear();
+        let king_color = if self.perspective == Color::White {
+            Color::White
+        } else {
+            Color::Black
+        };
+        self.king_square = board
+            .king_square(king_color)
+            .map(|sq| orient_square(sq, self.perspective));
+        if self.king_square.is_none() {
+            return;
+        }
+        for color in [Color::White, Color::Black] {
+            for kind in [
+                PieceKind::Pawn,
+                PieceKind::Knight,
+                PieceKind::Bishop,
+                PieceKind::Rook,
+                PieceKind::Queen,
+                PieceKind::King,
+            ] {
+                let mut bb = board.piece_bitboards[color.idx()][kind.idx()];
+                while bb != 0 {
+                    let idx = bb.trailing_zeros() as u8;
+                    bb &= bb - 1;
+                    let sq = Square::from_index(idx);
+                    if let Some(feature) =
+                        self.feature_index(color, kind, sq, self.king_square.unwrap())
+                    {
+                        self.active.push(feature);
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_piece(&mut self, color: Color, kind: PieceKind, square: Square) {
+        if let Some(king_sq) = self.king_square {
+            if let Some(feature) = self.feature_index(color, kind, square, king_sq) {
+                self.active.push(feature);
+            }
+        }
+    }
+
+    fn remove_piece(&mut self, color: Color, kind: PieceKind, square: Square) {
+        if let Some(king_sq) = self.king_square {
+            if let Some(feature) = self.feature_index(color, kind, square, king_sq) {
+                if let Some(pos) = self.active.iter().position(|&v| v == feature) {
+                    self.active.swap_remove(pos);
+                }
+            }
+        }
+    }
+
+    fn feature_index(
+        &self,
+        piece_color: Color,
+        kind: PieceKind,
+        square: Square,
+        king_sq: Square,
+    ) -> Option<i64> {
+        let oriented_sq = orient_square(square, self.perspective);
+        let oriented_color = orient_color(piece_color, self.perspective);
+        let plane = kind.idx() + if oriented_color == Color::White { 0 } else { 6 };
+        let index =
+            king_sq.to_index() * (12 * 64) + plane * 64 + oriented_sq.to_index();
+        Some(index as i64)
+    }
+}
+
+#[derive(Clone)]
 pub struct Board {
-    squares: [[Option<Piece>; 8]; 8],
+    piece_bitboards: [[Bitboard; 6]; 2],
+    occupancy: Bitboard,
+    occupancy_by_color: [Bitboard; 2],
+    nnue: [NnueAccumulator; 2],
     pub active_color: Color,
     pub castling_rights: CastlingRights,
     pub en_passant: Option<Square>,
@@ -391,7 +640,13 @@ impl Default for Board {
 impl Board {
     pub fn empty() -> Self {
         Self {
-            squares: [[None; 8]; 8],
+            piece_bitboards: [[0; 6]; 2],
+            occupancy: 0,
+            occupancy_by_color: [0; 2],
+            nnue: [
+                NnueAccumulator::new(Color::White),
+                NnueAccumulator::new(Color::Black),
+            ],
             active_color: Color::White,
             castling_rights: CastlingRights::default(),
             en_passant: None,
@@ -434,26 +689,96 @@ impl Board {
             black_kingside: true,
             black_queenside: true,
         });
+        board.rebuild_nnue_state();
         board
     }
 
     pub fn set_piece(&mut self, square: Square, piece: Option<Piece>) {
-        let (r, f) = square.to_indices();
         let idx = square.to_index();
         let keys = zobrist_keys();
-        if let Some(old) = self.squares[r][f] {
+        if let Some(old) = self.remove_piece_internal(square) {
             self.zobrist ^= keys.pieces[old.color.idx()][old.kind.idx()][idx];
+            self.nnue_remove_piece(old, square);
         }
-        self.squares[r][f] = piece;
-        if let Some(new_piece) = self.squares[r][f] {
-            self.zobrist ^=
-                keys.pieces[new_piece.color.idx()][new_piece.kind.idx()][idx];
+        if let Some(p) = piece {
+            self.place_piece_internal(square, p);
+            self.zobrist ^= keys.pieces[p.color.idx()][p.kind.idx()][idx];
+            self.nnue_add_piece(p, square);
+            if p.kind == PieceKind::King {
+                self.rebuild_nnue_for_color(p.color);
+            }
         }
     }
 
     pub fn piece_at(&self, square: Square) -> Option<Piece> {
-        let (r, f) = square.to_indices();
-        self.squares[r][f]
+        let mask = square_bitboard(square);
+        for color_idx in 0..2 {
+            if self.occupancy_by_color[color_idx] & mask != 0 {
+                for kind_idx in 0..6 {
+                    if self.piece_bitboards[color_idx][kind_idx] & mask != 0 {
+                        return Some(Piece::new(
+                            Color::from_idx(color_idx),
+                            PieceKind::from(kind_idx),
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn remove_piece_internal(&mut self, square: Square) -> Option<Piece> {
+        let mask = square_bitboard(square);
+        for color_idx in 0..2 {
+            if self.occupancy_by_color[color_idx] & mask != 0 {
+                for kind_idx in 0..6 {
+                    if self.piece_bitboards[color_idx][kind_idx] & mask != 0 {
+                        self.piece_bitboards[color_idx][kind_idx] &= !mask;
+                        self.occupancy_by_color[color_idx] &= !mask;
+                        self.occupancy &= !mask;
+                        return Some(Piece::new(
+                            Color::from_idx(color_idx),
+                            PieceKind::from(kind_idx),
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn place_piece_internal(&mut self, square: Square, piece: Piece) {
+        let mask = square_bitboard(square);
+        let color_idx = piece.color.idx();
+        let kind_idx = piece.kind.idx();
+        self.piece_bitboards[color_idx][kind_idx] |= mask;
+        self.occupancy_by_color[color_idx] |= mask;
+        self.occupancy |= mask;
+    }
+
+    fn nnue_remove_piece(&mut self, piece: Piece, square: Square) {
+        for perspective in [Color::White, Color::Black] {
+            self.nnue[perspective.idx()].remove_piece(
+                piece.color,
+                piece.kind,
+                square,
+            );
+            if piece.kind == PieceKind::King && perspective == piece.color {
+                self.nnue[perspective.idx()].king_square = None;
+            }
+        }
+    }
+
+    fn nnue_add_piece(&mut self, piece: Piece, square: Square) {
+        for perspective in [Color::White, Color::Black] {
+            if piece.kind == PieceKind::King && perspective == piece.color {
+                self.nnue[perspective.idx()].king_square =
+                    Some(orient_square(square, perspective));
+                self.rebuild_nnue_for_color(piece.color);
+                return;
+            }
+            self.nnue[perspective.idx()].add_piece(piece.color, piece.kind, square);
+        }
     }
 
     pub fn set_active_color(&mut self, color: Color) {
@@ -518,6 +843,25 @@ impl Board {
         self.zobrist
     }
 
+    fn rebuild_nnue_state(&mut self) {
+        let mut white = NnueAccumulator::new(Color::White);
+        white.rebuild(self);
+        let mut black = NnueAccumulator::new(Color::Black);
+        black.rebuild(self);
+        self.nnue[Color::White.idx()] = white;
+        self.nnue[Color::Black.idx()] = black;
+    }
+
+    fn rebuild_nnue_for_color(&mut self, color: Color) {
+        let mut acc = NnueAccumulator::new(color);
+        acc.rebuild(self);
+        self.nnue[color.idx()] = acc;
+    }
+
+    pub fn nnue_active_indices(&self) -> &[i64] {
+        &self.nnue[self.active_color.idx()].active
+    }
+
     pub fn from_fen(fen: &str) -> Result<Self, FenError> {
         let mut parts = fen.split_whitespace();
         let placement = parts
@@ -576,6 +920,7 @@ impl Board {
             return Err(FenError::new("fullmove number must be > 0"));
         }
 
+        board.rebuild_nnue_state();
         Ok(board)
     }
 
@@ -663,7 +1008,8 @@ impl Board {
             let mut empty = 0;
 
             for file in 0..8 {
-                match self.squares[rank][file] {
+                let square = Square::unchecked(rank as u8, file as u8);
+                match self.piece_at(square) {
                     Some(piece) => {
                         if empty > 0 {
                             result.push(char::from_digit(empty, 10).unwrap());
@@ -704,31 +1050,22 @@ impl Board {
     }
 
     pub fn is_legal(&self) -> bool {
-        let mut white_kings = 0;
-        let mut black_kings = 0;
-
-        for rank in 0..8 {
-            for file in 0..8 {
-                if let Some(piece) = self.squares[rank][file] {
-                    match piece.kind {
-                        PieceKind::King => match piece.color {
-                            Color::White => white_kings += 1,
-                            Color::Black => black_kings += 1,
-                        },
-                        PieceKind::Pawn => {
-                            // Pawns cannot be on the first or eighth rank.
-                            if rank == 0 || rank == 7 {
-                                return false;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
+        let white_kings = self.piece_bitboards[Color::White.idx()]
+            [PieceKind::King.idx()]
+        .count_ones();
+        let black_kings = self.piece_bitboards[Color::Black.idx()]
+            [PieceKind::King.idx()]
+        .count_ones();
         if white_kings != 1 || black_kings != 1 {
             return false;
+        }
+
+        let home_rank_mask = rank_mask(0) | rank_mask(7);
+        for color in [Color::White, Color::Black] {
+            let pawns = self.piece_bitboards[color.idx()][PieceKind::Pawn.idx()];
+            if pawns & home_rank_mask != 0 {
+                return false;
+            }
         }
 
         if !self.castling_rights.validates_for(self) {
@@ -741,35 +1078,36 @@ impl Board {
         }
     }
 
-    pub fn legal_moves(&self) -> Vec<Move> {
-        let mut clone = self.clone();
-        let mut moves = Vec::new();
-        clone.legal_moves_into(&mut moves);
-        moves
-    }
-
     pub fn legal_moves_into(&mut self, moves: &mut Vec<Move>) {
+        let mut pseudo = Vec::new();
+        self.pseudo_legal_moves_into(&mut pseudo);
         moves.clear();
-        for mv in self.pseudo_legal_moves() {
+        for mv in pseudo {
             if self.move_is_legal_mut(mv) {
                 moves.push(mv);
             }
         }
     }
 
-    fn pseudo_legal_moves(&self) -> Vec<Move> {
-        let mut moves = Vec::new();
-        for rank in 0..8 {
-            for file in 0..8 {
-                if let Some(piece) = self.squares[rank][file]
-                    && piece.color == self.active_color
-                {
-                    let square = Square::unchecked(rank as u8, file as u8);
-                    self.generate_moves_for_piece(square, piece, &mut moves);
-                }
+    fn pseudo_legal_moves_into(&self, moves: &mut Vec<Move>) {
+        moves.clear();
+        let color = self.active_color;
+        for kind in [
+            PieceKind::Pawn,
+            PieceKind::Knight,
+            PieceKind::Bishop,
+            PieceKind::Rook,
+            PieceKind::Queen,
+            PieceKind::King,
+        ] {
+            let mut bb = self.piece_bitboards[color.idx()][kind.idx()];
+            while bb != 0 {
+                let idx = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                let square = Square::from_index(idx);
+                self.generate_moves_for_piece(square, Piece::new(color, kind), moves);
             }
         }
-        moves
     }
 
     fn generate_moves_for_piece(
@@ -783,18 +1121,12 @@ impl Board {
             PieceKind::Knight => {
                 self.generate_knight_moves(square, piece.color, moves)
             }
-            PieceKind::Bishop => self.generate_sliding_moves(
-                square,
-                piece.color,
-                moves,
-                &[(1, 1), (1, -1), (-1, 1), (-1, -1)],
-            ),
-            PieceKind::Rook => self.generate_sliding_moves(
-                square,
-                piece.color,
-                moves,
-                &[(1, 0), (-1, 0), (0, 1), (0, -1)],
-            ),
+            PieceKind::Bishop => {
+                self.generate_sliding_moves(square, piece.color, moves, &BISHOP_DIRS)
+            }
+            PieceKind::Rook => {
+                self.generate_sliding_moves(square, piece.color, moves, &ROOK_DIRS)
+            }
             PieceKind::Queen => self.generate_sliding_moves(
                 square,
                 piece.color,
@@ -824,30 +1156,32 @@ impl Board {
             Color::White => 1,
             Color::Black => -1,
         };
-
-        if let Some(one_step) = square.offset(dir, 0)
-            && self.piece_at(one_step).is_none()
-        {
-            moves.push(Move::new(square, one_step));
-
-            let start_rank = match color {
-                Color::White => 1,
-                Color::Black => 6,
-            };
-            if square.rank() == start_rank
-                && let Some(two_step) = square.offset(dir * 2, 0)
-                && self.piece_at(two_step).is_none()
-            {
-                moves.push(Move::new(square, two_step));
+        if let Some(one_step) = square.offset(dir, 0) {
+            let mask = square_bitboard(one_step);
+            if self.occupancy & mask == 0 {
+                moves.push(Move::new(square, one_step));
+                let start_rank = match color {
+                    Color::White => 1,
+                    Color::Black => 6,
+                };
+                if square.rank() == start_rank {
+                    if let Some(two_step) = square.offset(dir * 2, 0) {
+                        let two_mask = square_bitboard(two_step);
+                        if self.occupancy & two_mask == 0 {
+                            moves.push(Move::new(square, two_step));
+                        }
+                    }
+                }
             }
         }
 
+        let enemy_occ = self.occupancy_by_color[color.opponent().idx()];
         for df in [-1, 1] {
-            if let Some(target) = square.offset(dir, df)
-                && let Some(piece) = self.piece_at(target)
-                && piece.color != color
-            {
-                moves.push(Move::new(square, target));
+            if let Some(target) = square.offset(dir, df) {
+                let mask = square_bitboard(target);
+                if enemy_occ & mask != 0 {
+                    moves.push(Move::new(square, target));
+                }
             }
         }
     }
@@ -858,27 +1192,8 @@ impl Board {
         color: Color,
         moves: &mut Vec<Move>,
     ) {
-        const KNIGHT_OFFSETS: [(i8, i8); 8] = [
-            (1, 2),
-            (2, 1),
-            (2, -1),
-            (1, -2),
-            (-1, -2),
-            (-2, -1),
-            (-2, 1),
-            (-1, 2),
-        ];
-        for (dr, df) in KNIGHT_OFFSETS {
-            if let Some(target) = square.offset(dr, df) {
-                match self.piece_at(target) {
-                    None => moves.push(Move::new(square, target)),
-                    Some(piece) if piece.color != color => {
-                        moves.push(Move::new(square, target))
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let attacks = knight_attacks(square) & !self.occupancy_by_color[color.idx()];
+        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
     }
 
     fn generate_sliding_moves(
@@ -888,20 +1203,9 @@ impl Board {
         moves: &mut Vec<Move>,
         directions: &[(i8, i8)],
     ) {
-        for (dr, df) in directions {
-            let mut current = square;
-            while let Some(next) = current.offset(*dr, *df) {
-                match self.piece_at(next) {
-                    None => moves.push(Move::new(square, next)),
-                    Some(piece) if piece.color != color => {
-                        moves.push(Move::new(square, next));
-                        break;
-                    }
-                    _ => break,
-                }
-                current = next;
-            }
-        }
+        let attacks = sliding_attacks_from(square, self.occupancy, directions)
+            & !self.occupancy_by_color[color.idx()];
+        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
     }
 
     fn generate_king_moves(
@@ -910,23 +1214,8 @@ impl Board {
         color: Color,
         moves: &mut Vec<Move>,
     ) {
-        for df in -1..=1 {
-            for dr in -1..=1 {
-                if df == 0 && dr == 0 {
-                    continue;
-                }
-
-                if let Some(target) = square.offset(dr, df) {
-                    match self.piece_at(target) {
-                        None => moves.push(Move::new(square, target)),
-                        Some(piece) if piece.color != color => {
-                            moves.push(Move::new(square, target))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        let attacks = king_attacks(square) & !self.occupancy_by_color[color.idx()];
+        for_each_bit(attacks, |target| moves.push(Move::new(square, target)));
     }
 
     fn move_is_legal(&self, mv: Move) -> bool {
@@ -1094,183 +1383,58 @@ impl Board {
     }
 
     fn king_square(&self, color: Color) -> Option<Square> {
-        for rank in 0..8 {
-            for file in 0..8 {
-                if self.squares[rank][file]
-                    == Some(Piece::new(color, PieceKind::King))
-                {
-                    return Some(Square::unchecked(rank as u8, file as u8));
-                }
-            }
+        let bb = self.piece_bitboards[color.idx()][PieceKind::King.idx()];
+        if bb != 0 {
+            Some(Square::from_index(bb.trailing_zeros() as u8))
+        } else {
+            None
         }
-        None
     }
 
     fn square_attacked(&self, square: Square, by: Color) -> bool {
-        let pawn_dirs: [(i8, i8); 2] = match by {
-            Color::White => [(-1, -1), (-1, 1)],
-            Color::Black => [(1, -1), (1, 1)],
-        };
-        for (dr, df) in pawn_dirs {
-            if let Some(source) = square.offset(dr, df)
-                && self.piece_at(source) == Some(Piece::new(by, PieceKind::Pawn))
-            {
-                return true;
-            }
-        }
-
-        const KNIGHT_OFFSETS: [(i8, i8); 8] = [
-            (1, 2),
-            (2, 1),
-            (2, -1),
-            (1, -2),
-            (-1, -2),
-            (-2, -1),
-            (-2, 1),
-            (-1, 2),
-        ];
-        for (dr, df) in KNIGHT_OFFSETS {
-            if let Some(source) = square.offset(dr, df)
-                && self.piece_at(source) == Some(Piece::new(by, PieceKind::Knight))
-            {
-                return true;
-            }
-        }
-
-        for dr in -1..=1 {
-            for df in -1..=1 {
-                if dr == 0 && df == 0 {
-                    continue;
-                }
-                if let Some(source) = square.offset(dr, df)
-                    && self.piece_at(source) == Some(Piece::new(by, PieceKind::King))
-                {
-                    return true;
-                }
-            }
-        }
-
-        if self.attack_in_directions(
-            square,
-            by,
-            &[(1, 1), (1, -1), (-1, 1), (-1, -1)],
-            &[PieceKind::Bishop, PieceKind::Queen],
-        ) {
-            return true;
-        }
-        if self.attack_in_directions(
-            square,
-            by,
-            &[(1, 0), (-1, 0), (0, 1), (0, -1)],
-            &[PieceKind::Rook, PieceKind::Queen],
-        ) {
+        let idx = by.idx();
+        let occupancy = self.occupancy;
+        let pawns = self.piece_bitboards[idx][PieceKind::Pawn.idx()];
+        if pawns & pawn_attacks(square, by.opponent()) != 0 {
             return true;
         }
 
-        false
-    }
-
-    fn attack_in_directions(
-        &self,
-        square: Square,
-        color: Color,
-        directions: &[(i8, i8)],
-        attackers: &[PieceKind],
-    ) -> bool {
-        for (dr, df) in directions {
-            let mut current = square;
-            while let Some(next) = current.offset(*dr, *df) {
-                if let Some(piece) = self.piece_at(next) {
-                    if piece.color == color && attackers.contains(&piece.kind) {
-                        return true;
-                    }
-                    break;
-                }
-                current = next;
-            }
+        let knights = self.piece_bitboards[idx][PieceKind::Knight.idx()];
+        if knights & knight_attacks(square) != 0 {
+            return true;
         }
+
+        let king = self.piece_bitboards[idx][PieceKind::King.idx()];
+        if king & king_attacks(square) != 0 {
+            return true;
+        }
+
+        let bishops = self.piece_bitboards[idx][PieceKind::Bishop.idx()];
+        let rooks = self.piece_bitboards[idx][PieceKind::Rook.idx()];
+        let queens = self.piece_bitboards[idx][PieceKind::Queen.idx()];
+
+        if sliding_attacks_from(square, occupancy, &BISHOP_DIRS) & (bishops | queens)
+            != 0
+        {
+            return true;
+        }
+
+        if sliding_attacks_from(square, occupancy, &ROOK_DIRS) & (rooks | queens) != 0
+        {
+            return true;
+        }
+
         false
     }
 
     pub fn halfka(&self) -> Result<Vec<f32>> {
-        if self.active_color == Color::White {
-            self.halfka_from_white()
-        } else {
-            let mut flipped = self.flipped();
-            flipped.set_active_color(Color::White);
-            flipped.halfka_from_white()
+        let mut dense = vec![0_f32; 64 * (12 * 64)];
+        let acc = &self.nnue[self.active_color.idx()];
+        let _king_sq = acc.king_square.ok_or_else(|| E::msg("King is missing."))?;
+        for &idx in &acc.active {
+            dense[idx as usize] = 1.0;
         }
-    }
-
-    fn flipped(&self) -> Self {
-        let mut flipped = self.clone();
-        for rank in 0..4 {
-            for file in 0..8 {
-                let piece = self
-                    .piece_at(Square::unchecked(rank, file))
-                    .map(|v| v.betray());
-                flipped.set_piece(
-                    Square::unchecked(rank, file),
-                    self.piece_at(Square::unchecked(7 - rank, file))
-                        .map(|v| v.betray()),
-                );
-                flipped.set_piece(Square::unchecked(7 - rank, file), piece);
-            }
-        }
-        flipped
-    }
-
-    fn halfka_from_white(&self) -> Result<Vec<f32>> {
-        let mut features = vec![0_f32; 64 * (12 * 64)];
-        let mut king_square = None;
-
-        let square_index = |rank: usize, file: usize| rank * 8 + file;
-
-        for rank in 0..8 {
-            for file in 0..8 {
-                if let Some(piece) = self.squares[rank][file]
-                    && piece.kind == PieceKind::King
-                    && piece.color == self.active_color
-                {
-                    if king_square.is_none() {
-                        king_square = Some((rank, file));
-                    } else {
-                        return Err(E::msg("Multiple king has found."));
-                    }
-                }
-            }
-        }
-        let king_square = if let Some(ks) = king_square {
-            ks
-        } else {
-            return Err(E::msg("King is missing."));
-        };
-
-        let get_index = |rank: u32, file: u32| {
-            if let Some(piece) = self.squares[rank as usize][file as usize] {
-                let mut idx =
-                    square_index(king_square.0, king_square.1) as u32 * (12 * 64);
-                let piecekind = if piece.color == self.active_color {
-                    piece.kind as u32
-                } else {
-                    piece.kind as u32 + 6
-                };
-                idx += piecekind * 64
-                    + square_index(rank as usize, file as usize) as u32;
-                Some(idx as usize)
-            } else {
-                None
-            }
-        };
-        for rank in 0..8 {
-            for file in 0..8 {
-                if let Some(idx) = get_index(rank, file) {
-                    features[idx] = 1_f32;
-                }
-            }
-        }
-
-        Ok(features)
+        Ok(dense)
     }
 }
 
@@ -1337,6 +1501,54 @@ mod tests {
         assert!(Square::new(0, 8).is_none());
     }
 
+    fn squares_from_bitboard(bb: Bitboard) -> Vec<String> {
+        let mut out = Vec::new();
+        for_each_bit(bb, |sq| out.push(sq.to_algebraic()));
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn knight_attack_mask_is_correct() {
+        let sq = Square::from_algebraic("d4").expect("square");
+        let attacks = knight_attacks(sq);
+        let expected = vec![
+            "b3".to_string(),
+            "b5".to_string(),
+            "c2".to_string(),
+            "c6".to_string(),
+            "e2".to_string(),
+            "e6".to_string(),
+            "f3".to_string(),
+            "f5".to_string(),
+        ];
+        assert_eq!(squares_from_bitboard(attacks), expected);
+    }
+
+    #[test]
+    fn sliding_attacks_respect_blockers() {
+        let mut board = Board::empty();
+        let bishop_sq = Square::from_algebraic("d4").unwrap();
+        board.set_piece(bishop_sq, Some(Piece::new(Color::White, PieceKind::Bishop)));
+        let blocker = Square::from_algebraic("f6").unwrap();
+        board.set_piece(blocker, Some(Piece::new(Color::White, PieceKind::Pawn)));
+        let occ = board.occupancy;
+        let attacks = sliding_attacks_from(bishop_sq, occ, &BISHOP_DIRS);
+        assert!(attacks & square_bitboard(blocker) != 0);
+        let beyond = Square::from_algebraic("g7").unwrap();
+        assert_eq!(attacks & square_bitboard(beyond), 0);
+    }
+
+    #[test]
+    fn square_attacked_detects_sliders() {
+        let mut board = Board::empty();
+        let king_sq = Square::from_algebraic("e4").unwrap();
+        board.set_piece(king_sq, Some(Piece::new(Color::White, PieceKind::King)));
+        let rook_sq = Square::from_algebraic("e8").unwrap();
+        board.set_piece(rook_sq, Some(Piece::new(Color::Black, PieceKind::Rook)));
+        assert!(board.square_attacked(king_sq, Color::Black));
+    }
+
     #[test]
     fn starting_fen_round_trip() {
         let start = Board::from_fen(
@@ -1370,8 +1582,10 @@ mod tests {
 
     #[test]
     fn starting_position_has_twenty_legal_moves() {
-        let board = Board::starting_position();
-        assert_eq!(board.legal_moves().len(), 20);
+        let mut board = Board::starting_position();
+        let mut moves = Vec::new();
+        board.legal_moves_into(&mut moves);
+        assert_eq!(moves.len(), 20);
     }
 
     #[test]
@@ -1395,7 +1609,8 @@ mod tests {
             Some(Piece::new(Color::Black, PieceKind::Rook)),
         );
 
-        let moves = board.legal_moves();
+        let mut moves = Vec::new();
+        board.legal_moves_into(&mut moves);
         let illegal = Move::new(Square::unchecked(6, 4), Square::unchecked(6, 5));
         assert!(
             !moves.contains(&illegal),
