@@ -1,4 +1,4 @@
-use crate::chess::{Board, Move, MoveList, PieceKind};
+use crate::chess::{Board, Move, MoveList, PieceKind, piece_value};
 use crate::nnue_runtime::NnueRuntime;
 use crate::tt::{Bound, TranspositionTable};
 use std::time::{Duration, Instant};
@@ -307,6 +307,10 @@ fn negamax(
     for &mv in moves.as_slice() {
         let undo = board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
+        if is_capture && depth > 0 && board.static_exchange_eval(mv) < 0 {
+            board.unmake_move(undo);
+            continue;
+        }
         let score = -negamax(
             board,
             tt,
@@ -375,6 +379,9 @@ fn quiescence(
 
     for &mv in moves.as_slice() {
         if board.piece_at(mv.to).is_none() {
+            continue;
+        }
+        if board.static_exchange_eval(mv) < 0 {
             continue;
         }
         let undo = board.make_move(mv);
@@ -454,15 +461,4 @@ fn move_score(
     score += state.history_score(mv);
 
     score
-}
-
-fn piece_value(kind: PieceKind) -> i32 {
-    match kind {
-        PieceKind::Pawn => 100,
-        PieceKind::Knight => 300,
-        PieceKind::Bishop => 325,
-        PieceKind::Rook => 500,
-        PieceKind::Queen => 900,
-        PieceKind::King => 10_000,
-    }
 }

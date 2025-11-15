@@ -101,6 +101,12 @@ impl PieceKind {
     }
 }
 
+const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 30_000];
+
+pub fn piece_value(kind: PieceKind) -> i32 {
+    PIECE_VALUES[kind.idx()]
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Piece {
     pub color: Color,
@@ -549,6 +555,66 @@ impl CastlingRights {
     }
 }
 
+fn attackers_to_with(
+    square: Square,
+    occupancy: Bitboard,
+    bitboards: &[[Bitboard; 6]; 2],
+) -> Bitboard {
+    let mut attackers = 0;
+    attackers |= pawn_attacks(square, Color::Black)
+        & bitboards[Color::White.idx()][PieceKind::Pawn.idx()];
+    attackers |= pawn_attacks(square, Color::White)
+        & bitboards[Color::Black.idx()][PieceKind::Pawn.idx()];
+    attackers |= knight_attacks(square)
+        & (bitboards[Color::White.idx()][PieceKind::Knight.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::Knight.idx()]);
+    let bishop_attacks = sliding_attacks_from(square, occupancy, &BISHOP_DIRS);
+    attackers |= bishop_attacks
+        & (bitboards[Color::White.idx()][PieceKind::Bishop.idx()]
+            | bitboards[Color::White.idx()][PieceKind::Queen.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::Bishop.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::Queen.idx()]);
+    let rook_attacks = sliding_attacks_from(square, occupancy, &ROOK_DIRS);
+    attackers |= rook_attacks
+        & (bitboards[Color::White.idx()][PieceKind::Rook.idx()]
+            | bitboards[Color::White.idx()][PieceKind::Queen.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::Rook.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::Queen.idx()]);
+    attackers |= king_attacks(square)
+        & (bitboards[Color::White.idx()][PieceKind::King.idx()]
+            | bitboards[Color::Black.idx()][PieceKind::King.idx()]);
+    attackers
+}
+
+fn smallest_attacker_from(
+    attackers: Bitboard,
+    color: Color,
+    bitboards: &[[Bitboard; 6]; 2],
+) -> Option<(PieceKind, Square)> {
+    for kind in PieceKind::all() {
+        let bb = attackers & bitboards[color.idx()][kind.idx()];
+        if bb != 0 {
+            let sq = Square::from_index(bb.trailing_zeros() as u8);
+            return Some((kind, sq));
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
+pub struct Board {
+    piece_bitboards: [[Bitboard; 6]; 2],
+    occupancy: Bitboard,
+    occupancy_by_color: [Bitboard; 2],
+    nnue: [NnueAccumulator; 2],
+    pub active_color: Color,
+    pub castling_rights: CastlingRights,
+    pub en_passant: Option<Square>,
+    pub halfmove_clock: u32,
+    pub fullmove_number: u32,
+    zobrist: u64,
+}
+
 #[derive(Clone)]
 pub struct MoveList {
     data: [Move; MAX_MOVES],
@@ -677,20 +743,6 @@ impl NnueAccumulator {
             king_sq.to_index() * (12 * 64) + plane * 64 + oriented_sq.to_index();
         Some(index as i64)
     }
-}
-
-#[derive(Clone)]
-pub struct Board {
-    piece_bitboards: [[Bitboard; 6]; 2],
-    occupancy: Bitboard,
-    occupancy_by_color: [Bitboard; 2],
-    nnue: [NnueAccumulator; 2],
-    pub active_color: Color,
-    pub castling_rights: CastlingRights,
-    pub en_passant: Option<Square>,
-    pub halfmove_clock: u32,
-    pub fullmove_number: u32,
-    zobrist: u64,
 }
 
 impl Default for Board {
@@ -1272,6 +1324,81 @@ impl Board {
     ) {
         let attacks = king_attacks(square) & !self.occupancy_by_color[color.idx()];
         for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
+    }
+
+    pub fn static_exchange_eval(&self, mv: Move) -> i32 {
+        const MAX_DEPTH: usize = 32;
+        let mut gain = [0_i32; MAX_DEPTH];
+        let mut depth = 0;
+        let target = mv.to;
+        let target_mask = square_bitboard(target);
+        let mut bitboards = self.piece_bitboards;
+        let mut occ_by_color = self.occupancy_by_color;
+        let mut occupancy = self.occupancy;
+        let moving = match self.piece_at(mv.from) {
+            Some(piece) => piece,
+            None => return 0,
+        };
+
+        gain[0] = self
+            .piece_at(target)
+            .map(|p| piece_value(p.kind))
+            .unwrap_or(0);
+
+        if let Some(captured) = self.piece_at(target) {
+            bitboards[captured.color.idx()][captured.kind.idx()] &= !target_mask;
+            occ_by_color[captured.color.idx()] &= !target_mask;
+            occupancy &= !target_mask;
+        }
+
+        let from_mask = square_bitboard(mv.from);
+        bitboards[moving.color.idx()][moving.kind.idx()] &= !from_mask;
+        occ_by_color[moving.color.idx()] &= !from_mask;
+        occupancy &= !from_mask;
+
+        bitboards[moving.color.idx()][moving.kind.idx()] |= target_mask;
+        occ_by_color[moving.color.idx()] |= target_mask;
+        occupancy |= target_mask;
+
+        let mut current_value = piece_value(moving.kind);
+        let mut attackers = attackers_to_with(target, occupancy, &bitboards);
+        let mut side = moving.color.opponent();
+        let mut target_owner = moving.color;
+        let mut target_kind = moving.kind;
+
+        while let Some((kind, sq)) =
+            smallest_attacker_from(attackers, side, &bitboards)
+        {
+            depth += 1;
+            gain[depth] = current_value - gain[depth - 1];
+            if gain[depth].max(-gain[depth - 1]) < 0 {
+                break;
+            }
+
+            let sq_mask = square_bitboard(sq);
+            bitboards[side.idx()][kind.idx()] &= !sq_mask;
+            occ_by_color[side.idx()] &= !sq_mask;
+            occupancy &= !sq_mask;
+
+            bitboards[target_owner.idx()][target_kind.idx()] &= !target_mask;
+            occ_by_color[target_owner.idx()] &= !target_mask;
+
+            bitboards[side.idx()][kind.idx()] |= target_mask;
+            occ_by_color[side.idx()] |= target_mask;
+            occupancy |= target_mask;
+
+            current_value = piece_value(kind);
+            target_owner = side;
+            target_kind = kind;
+            side = side.opponent();
+            attackers = attackers_to_with(target, occupancy, &bitboards);
+        }
+
+        while depth > 0 {
+            gain[depth - 1] = -gain[depth - 1].max(-gain[depth]);
+            depth -= 1;
+        }
+        gain[0]
     }
 
     fn move_is_legal(&self, mv: Move) -> bool {
