@@ -1,6 +1,6 @@
 use suckfish::chess::{Board, Move};
 use suckfish::nnue_runtime::NnueRuntime;
-use suckfish::search::{SearchReport, search_best_move};
+use suckfish::search::{search_best_move, SearchReport};
 use suckfish::time_manager::{TimeBudget, TimeManager};
 use suckfish::tt::TranspositionTable;
 
@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, TryRecvError},
+    Arc,
 };
 use std::thread;
 use std::time::Duration;

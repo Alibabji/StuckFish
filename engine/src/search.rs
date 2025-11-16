@@ -1,10 +1,10 @@
-use crate::chess::{Board, Move, MoveList, PieceKind, piece_value};
+use crate::chess::{piece_value, Board, Move, MoveList, PieceKind};
 use crate::nnue_runtime::NnueRuntime;
 use crate::time_manager::TimeBudget;
 use crate::tt::{Bound, TranspositionTable};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::{Duration, Instant};
 
@@ -243,22 +243,46 @@ fn search_single_depth(
     preferred: Option<Move>,
     window: SearchWindow,
 ) -> (Option<Move>, i32) {
-    let tt_move = ctx.tt.probe(ctx.board.hash()).and_then(|entry| entry.best_move);
+    let tt_move = ctx
+        .tt
+        .probe(ctx.board.hash())
+        .and_then(|entry| entry.best_move);
     let killers = ctx.state.killer_moves(0);
-    order_moves(ctx.board, root_moves, preferred, tt_move, killers, ctx.state);
+    order_moves(
+        ctx.board, root_moves, preferred, tt_move, killers, ctx.state,
+    );
 
     let mut best_move = None;
     let mut best_score = -MATE_VALUE;
     let mut bounds = window;
+    let mut move_count = 0;
 
     for &mv in root_moves.iter() {
+        move_count += 1;
         let undo = ctx.board.make_move(mv);
-        let score = -negamax(
-            ctx,
-            depth.saturating_sub(1),
-            SearchWindow::new(-bounds.beta, -bounds.alpha),
-            1,
-        );
+        let mut score;
+        if move_count == 1 {
+            score = -negamax(
+                ctx,
+                depth.saturating_sub(1),
+                SearchWindow::new(-bounds.beta, -bounds.alpha),
+                1,
+                true,
+            );
+        } else {
+            let narrow =
+                SearchWindow::new(-bounds.alpha.saturating_add(1), -bounds.alpha);
+            score = -negamax(ctx, depth.saturating_sub(1), narrow, 1, false);
+            if score > bounds.alpha && score < bounds.beta {
+                score = -negamax(
+                    ctx,
+                    depth.saturating_sub(1),
+                    SearchWindow::new(-bounds.beta, -bounds.alpha),
+                    1,
+                    true,
+                );
+            }
+        }
         ctx.board.unmake_move(undo);
         if score > best_score {
             best_score = score;
@@ -278,6 +302,7 @@ fn negamax(
     depth: u8,
     mut window: SearchWindow,
     ply: usize,
+    is_pv: bool,
 ) -> i32 {
     if ctx.state.should_stop() {
         return 0;
@@ -308,7 +333,8 @@ fn negamax(
     }
 
     const NULL_MOVE_REDUCTION: u8 = 2;
-    if depth > NULL_MOVE_REDUCTION + 1 && !ctx.board.is_in_check(ctx.board.active_color)
+    if depth > NULL_MOVE_REDUCTION + 1
+        && !ctx.board.is_in_check(ctx.board.active_color)
     {
         let undo = ctx.board.make_null_move();
         let score = -negamax(
@@ -316,6 +342,7 @@ fn negamax(
             depth - 1 - NULL_MOVE_REDUCTION,
             SearchWindow::new(-window.beta, -window.beta + 1),
             ply + 1,
+            false,
         );
         ctx.board.unmake_null_move(undo);
         if score >= window.beta {
@@ -337,19 +364,48 @@ fn negamax(
 
     let mut best_value = -MATE_VALUE;
     let mut best_move = None;
+    let mut move_count = 0;
     for &mv in moves.as_slice() {
+        move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
         if is_capture && depth > 0 && ctx.board.static_exchange_eval(mv) < 0 {
             ctx.board.unmake_move(undo);
             continue;
         }
-        let score = -negamax(
-            ctx,
-            depth.saturating_sub(1),
-            window.flipped(),
-            ply + 1,
-        );
+        let gives_check = ctx.board.is_in_check(ctx.board.active_color);
+        let mut child_depth = depth.saturating_sub(1);
+        let mut reduced = false;
+        let child_is_pv = is_pv && move_count == 1;
+        if depth >= 3 && move_count > 1 && !is_capture && !gives_check && !child_is_pv
+        {
+            reduced = true;
+            let reduction = 1 + (move_count > 6) as u8 + (depth > 5) as u8;
+            child_depth = child_depth.saturating_sub(reduction);
+        }
+        let mut score;
+        if child_is_pv {
+            score = -negamax(ctx, child_depth, window.flipped(), ply + 1, true);
+        } else {
+            let narrow =
+                SearchWindow::new(-window.alpha.saturating_add(1), -window.alpha);
+            score = -negamax(ctx, child_depth, narrow, ply + 1, false);
+            if reduced && score > window.alpha {
+                child_depth = depth.saturating_sub(1);
+                let retry =
+                    SearchWindow::new(-window.alpha.saturating_add(1), -window.alpha);
+                score = -negamax(ctx, child_depth, retry, ply + 1, false);
+            }
+            if score > window.alpha && score < window.beta {
+                score = -negamax(
+                    ctx,
+                    depth.saturating_sub(1),
+                    window.flipped(),
+                    ply + 1,
+                    true,
+                );
+            }
+        }
         ctx.board.unmake_move(undo);
         if score > best_value {
             best_value = score;
@@ -392,7 +448,10 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
 
     let mut moves = MoveList::new();
     ctx.board.legal_moves_into(&mut moves);
-    let tt_move = ctx.tt.probe(ctx.board.hash()).and_then(|entry| entry.best_move);
+    let tt_move = ctx
+        .tt
+        .probe(ctx.board.hash())
+        .and_then(|entry| entry.best_move);
     let killers = ctx.state.killer_moves(ply);
     order_moves(ctx.board, &mut moves, None, tt_move, killers, ctx.state);
 
@@ -404,11 +463,8 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
             continue;
         }
         let undo = ctx.board.make_move(mv);
-        let score = -quiescence(
-            ctx,
-            SearchWindow::new(-window.beta, -window.alpha),
-            ply + 1,
-        );
+        let score =
+            -quiescence(ctx, SearchWindow::new(-window.beta, -window.alpha), ply + 1);
         ctx.board.unmake_move(undo);
 
         if score >= window.beta {

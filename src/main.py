@@ -55,13 +55,13 @@ def download(url, path):
         print("FAILED DOWNLOAD", path)
         exit(1)
 
-download('https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.9.0%2Bcpu.zip', 'libtorch.zip')
-with zipfile.ZipFile('libtorch.zip', 'r') as zf:
-    zf.extractall('.')
+if not os.path.isdir('libtorch'):
+    download('https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.9.0%2Bcpu.zip', 'libtorch.zip')
+    with zipfile.ZipFile('libtorch.zip', 'r') as zf:
+        zf.extractall('.')
 
 env = os.environ.copy()
 LIBTORCH = pathlib.Path(os.getcwd()) / 'libtorch'
-print(LIBTORCH)
 env["LIBTORCH"] = LIBTORCH
 old_path = os.environ.get("PATH", "")
 env["PATH"] = f"{LIBTORCH}/bin" + (f":{old_path}" if old_path else "")

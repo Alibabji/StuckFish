@@ -1,6 +1,6 @@
 use crate::chess::Board;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use std::collections::HashSet;
 use std::fmt;
@@ -8,9 +8,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tch::nn::OptimizerConfig;
 use tch::nn::init::DEFAULT_KAIMING_UNIFORM;
-use tch::{Device, Kind, Reduction, Tensor, nn};
+use tch::nn::OptimizerConfig;
+use tch::{nn, Device, Kind, Reduction, Tensor};
 
 const HALF_KA_DIM: i64 = 64 * 12 * 64;
 const DEFAULT_FEATURE_DIM: i64 = 256;

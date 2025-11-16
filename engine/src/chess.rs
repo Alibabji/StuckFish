@@ -368,6 +368,49 @@ fn sliding_attacks_from(
     attacks
 }
 
+fn direction_step(from: Square, to: Square) -> Option<(i8, i8)> {
+    let dr = to.rank() as i8 - from.rank() as i8;
+    let df = to.file() as i8 - from.file() as i8;
+    if dr == 0 && df == 0 {
+        return None;
+    }
+    if dr == 0 {
+        return Some((0, df.signum()));
+    }
+    if df == 0 {
+        return Some((dr.signum(), 0));
+    }
+    if dr.abs() == df.abs() {
+        return Some((dr.signum(), df.signum()));
+    }
+    None
+}
+
+fn squares_between(from: Square, to: Square) -> Bitboard {
+    let mut mask = 0;
+    if let Some((dr, df)) = direction_step(from, to) {
+        let mut current = from;
+        while let Some(next) = current.offset(dr, df) {
+            if next == to {
+                break;
+            }
+            mask |= square_bitboard(next);
+            current = next;
+        }
+    }
+    mask
+}
+
+fn ray_mask_from(square: Square, dr: i8, df: i8) -> Bitboard {
+    let mut mask = 0;
+    let mut current = square;
+    while let Some(next) = current.offset(dr, df) {
+        mask |= square_bitboard(next);
+        current = next;
+    }
+    mask
+}
+
 fn zobrist_keys() -> &'static ZobristKeys {
     static KEYS: OnceLock<ZobristKeys> = OnceLock::new();
     KEYS.get_or_init(ZobristKeys::new)
@@ -647,6 +690,7 @@ pub struct Board {
     occupancy: Bitboard,
     occupancy_by_color: [Bitboard; 2],
     nnue: [NnueAccumulator; 2],
+    movegen_cache: [Option<MoveGenCacheEntry>; 2],
     pub active_color: Color,
     pub castling_rights: CastlingRights,
     pub en_passant: Option<Square>,
@@ -659,6 +703,30 @@ pub struct Board {
 pub struct MoveList {
     data: [Move; MAX_MOVES],
     len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MoveGenCacheEntry {
+    king_square: Square,
+    response_mask: Bitboard,
+    check_count: u32,
+    pin_masks: [Bitboard; 64],
+}
+
+impl MoveGenCacheEntry {
+    fn new(
+        king_square: Square,
+        response_mask: Bitboard,
+        check_count: u32,
+        pin_masks: [Bitboard; 64],
+    ) -> Self {
+        Self {
+            king_square,
+            response_mask,
+            check_count,
+            pin_masks,
+        }
+    }
 }
 
 impl MoveList {
@@ -807,6 +875,7 @@ impl Board {
                 NnueAccumulator::new(Color::White),
                 NnueAccumulator::new(Color::Black),
             ],
+            movegen_cache: [None, None],
             active_color: Color::White,
             castling_rights: CastlingRights::default(),
             en_passant: None,
@@ -814,6 +883,71 @@ impl Board {
             fullmove_number: 1,
             zobrist: 0,
         }
+    }
+
+    fn invalidate_movegen_cache(&mut self) {
+        self.movegen_cache = [None, None];
+    }
+
+    fn movegen_entry(&mut self, color: Color) -> Option<&MoveGenCacheEntry> {
+        if self.movegen_cache[color.idx()].is_none() {
+            let entry = self.build_movegen_entry(color)?;
+            self.movegen_cache[color.idx()] = Some(entry);
+        }
+        self.movegen_cache[color.idx()].as_ref()
+    }
+
+    fn build_movegen_entry(&self, color: Color) -> Option<MoveGenCacheEntry> {
+        let king_square = self.king_square(color)?;
+        let enemy = color.opponent();
+        let occupancy = self.occupancy;
+        let enemy_pawns = self.piece_bitboards[enemy.idx()][PieceKind::Pawn.idx()];
+        let enemy_knights =
+            self.piece_bitboards[enemy.idx()][PieceKind::Knight.idx()];
+        let enemy_bishops =
+            self.piece_bitboards[enemy.idx()][PieceKind::Bishop.idx()];
+        let enemy_rooks = self.piece_bitboards[enemy.idx()][PieceKind::Rook.idx()];
+        let enemy_queens = self.piece_bitboards[enemy.idx()][PieceKind::Queen.idx()];
+
+        let pawn_checkers = enemy_pawns & pawn_attacks(king_square, color);
+        let knight_checkers = enemy_knights & knight_attacks(king_square);
+        let bishop_sliders = enemy_bishops | enemy_queens;
+        let rook_sliders = enemy_rooks | enemy_queens;
+        let bishop_attacks =
+            sliding_attacks_from(king_square, occupancy, &BISHOP_DIRS);
+        let rook_attacks = sliding_attacks_from(king_square, occupancy, &ROOK_DIRS);
+        let bishop_checkers = bishop_attacks & bishop_sliders;
+        let rook_checkers = rook_attacks & rook_sliders;
+        let checkers =
+            pawn_checkers | knight_checkers | bishop_checkers | rook_checkers;
+        let check_count = checkers.count_ones();
+
+        let mut response_mask: Bitboard = !0;
+        if check_count == 1 {
+            let checker_sq = Square::from_index(checkers.trailing_zeros() as u8);
+            response_mask = square_bitboard(checker_sq);
+            if (bishop_checkers | rook_checkers) & response_mask != 0 {
+                response_mask |= squares_between(king_square, checker_sq);
+            }
+        } else if check_count >= 2 {
+            response_mask = 0;
+        }
+
+        let mut pin_masks = [!0u64; 64];
+        self.compute_pin_masks(
+            color,
+            king_square,
+            bishop_sliders,
+            rook_sliders,
+            &mut pin_masks,
+        );
+
+        Some(MoveGenCacheEntry::new(
+            king_square,
+            response_mask,
+            check_count,
+            pin_masks,
+        ))
     }
 
     pub fn starting_position() -> Self {
@@ -854,6 +988,7 @@ impl Board {
     }
 
     pub fn set_piece(&mut self, square: Square, piece: Option<Piece>) {
+        self.invalidate_movegen_cache();
         let idx = square.to_index();
         let keys = zobrist_keys();
         if let Some(old) = self.remove_piece_internal(square) {
@@ -949,6 +1084,10 @@ impl Board {
     }
 
     pub fn set_en_passant(&mut self, square: Option<Square>) {
+        if self.en_passant == square {
+            return;
+        }
+        self.invalidate_movegen_cache();
         let keys = zobrist_keys();
         if let Some(old) = self.en_passant {
             self.zobrist ^= keys.en_passant[old.file() as usize];
@@ -960,6 +1099,10 @@ impl Board {
     }
 
     pub fn set_castling_rights(&mut self, rights: CastlingRights) {
+        if self.castling_rights == rights {
+            return;
+        }
+        self.invalidate_movegen_cache();
         let old = self.castling_rights;
         self.castling_rights = rights;
         self.update_castling_hash(old, rights);
@@ -1241,135 +1384,177 @@ impl Board {
     pub fn legal_moves_into(&mut self, buffer: &mut MoveList) {
         buffer.clear();
         let color = self.active_color;
-        let mut pseudo = MoveList::new();
-
-        for kind in PieceKind::all() {
-            let mut bb = self.piece_bitboards[color.idx()][kind.idx()];
-            while bb != 0 {
-                let idx = bb.trailing_zeros() as u8;
-                bb &= bb - 1;
-                let square = Square::from_index(idx);
-                pseudo.clear();
-                self.generate_moves_for_piece(
-                    square,
-                    Piece::new(color, kind),
-                    &mut pseudo,
-                );
-                for mv in pseudo.iter() {
-                    if self.move_is_legal(*mv) {
-                        buffer.push(*mv);
-                    }
-                }
-            }
-        }
-    }
-
-    fn generate_moves_for_piece(
-        &self,
-        square: Square,
-        piece: Piece,
-        buffer: &mut MoveList,
-    ) {
-        match piece.kind {
-            PieceKind::Pawn => self.generate_pawn_moves(square, piece.color, buffer),
-            PieceKind::Knight => {
-                self.generate_knight_moves(square, piece.color, buffer)
-            }
-            PieceKind::Bishop => {
-                self.generate_sliding_moves(square, piece.color, buffer, &BISHOP_DIRS)
-            }
-            PieceKind::Rook => {
-                self.generate_sliding_moves(square, piece.color, buffer, &ROOK_DIRS)
-            }
-            PieceKind::Queen => self.generate_sliding_moves(
-                square,
-                piece.color,
-                buffer,
-                &[
-                    (1, 0),
-                    (-1, 0),
-                    (0, 1),
-                    (0, -1),
-                    (1, 1),
-                    (1, -1),
-                    (-1, 1),
-                    (-1, -1),
-                ],
-            ),
-            PieceKind::King => self.generate_king_moves(square, piece.color, buffer),
-        }
-    }
-
-    fn generate_pawn_moves(
-        &self,
-        square: Square,
-        color: Color,
-        buffer: &mut MoveList,
-    ) {
-        let dir: i8 = match color {
-            Color::White => 1,
-            Color::Black => -1,
+        let Some(info) = self.movegen_entry(color).copied() else {
+            return;
         };
-        if let Some(one_step) = square.offset(dir, 0) {
-            let mask = square_bitboard(one_step);
-            if self.occupancy & mask == 0 {
-                buffer.push(Move::new(square, one_step));
-                let start_rank = match color {
-                    Color::White => 1,
-                    Color::Black => 6,
-                };
-                if square.rank() == start_rank {
-                    if let Some(two_step) = square.offset(dir * 2, 0) {
-                        let two_mask = square_bitboard(two_step);
-                        if self.occupancy & two_mask == 0 {
-                            buffer.push(Move::new(square, two_step));
+        let king_square = info.king_square;
+        let enemy = color.opponent();
+        let friendly_occ = self.occupancy_by_color[color.idx()];
+        let enemy_occ = self.occupancy_by_color[enemy.idx()];
+        let occupancy = self.occupancy;
+        let king_mask = square_bitboard(king_square);
+        let response_mask = info.response_mask;
+        let check_count = info.check_count;
+        let pin_masks = info.pin_masks;
+
+        let king_targets = king_attacks(king_square) & !friendly_occ;
+        for_each_bit(king_targets, |target| {
+            let to_mask = square_bitboard(target);
+            let occ_prime = (occupancy & !king_mask) | to_mask;
+            if !square_attacked_state(target, enemy, &self.piece_bitboards, occ_prime)
+            {
+                buffer.push(Move::new(king_square, target));
+            }
+        });
+
+        if check_count >= 2 {
+            return;
+        }
+
+        let mut pawns = self.piece_bitboards[color.idx()][PieceKind::Pawn.idx()];
+        let pawn_dir: i8 = if color == Color::White { 1 } else { -1 };
+        let pawn_start_rank = if color == Color::White { 1 } else { 6 };
+        while pawns != 0 {
+            let idx = pawns.trailing_zeros() as u8;
+            pawns &= pawns - 1;
+            let from = Square::from_index(idx);
+            let allowed = response_mask & pin_masks[idx as usize];
+            if allowed == 0 {
+                continue;
+            }
+
+            if let Some(one_step) = from.offset(pawn_dir, 0) {
+                let mask = square_bitboard(one_step);
+                if occupancy & mask == 0 && allowed & mask != 0 {
+                    buffer.push(Move::new(from, one_step));
+                    if from.rank() == pawn_start_rank {
+                        if let Some(two_step) = one_step.offset(pawn_dir, 0) {
+                            let two_mask = square_bitboard(two_step);
+                            if occupancy & two_mask == 0 && allowed & two_mask != 0 {
+                                buffer.push(Move::new(from, two_step));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let enemy_occ = self.occupancy_by_color[color.opponent().idx()];
-        for df in [-1, 1] {
-            if let Some(target) = square.offset(dir, df) {
-                let mask = square_bitboard(target);
-                if enemy_occ & mask != 0 {
-                    buffer.push(Move::new(square, target));
+            for df in [-1, 1] {
+                if let Some(target) = from.offset(pawn_dir, df) {
+                    let mask = square_bitboard(target);
+                    if allowed & mask == 0 {
+                        continue;
+                    }
+                    if enemy_occ & mask != 0 {
+                        buffer.push(Move::new(from, target));
+                    }
                 }
             }
         }
+
+        let mut knights = self.piece_bitboards[color.idx()][PieceKind::Knight.idx()];
+        while knights != 0 {
+            let idx = knights.trailing_zeros() as u8;
+            knights &= knights - 1;
+            let from = Square::from_index(idx);
+            let mut targets = knight_attacks(from) & !friendly_occ;
+            targets &= response_mask & pin_masks[idx as usize];
+            for_each_bit(targets, |target| buffer.push(Move::new(from, target)));
+        }
+
+        let mut bishops = self.piece_bitboards[color.idx()][PieceKind::Bishop.idx()];
+        while bishops != 0 {
+            let idx = bishops.trailing_zeros() as u8;
+            bishops &= bishops - 1;
+            let from = Square::from_index(idx);
+            let mut targets =
+                sliding_attacks_from(from, occupancy, &BISHOP_DIRS) & !friendly_occ;
+            targets &= response_mask & pin_masks[idx as usize];
+            for_each_bit(targets, |target| buffer.push(Move::new(from, target)));
+        }
+
+        let mut rooks = self.piece_bitboards[color.idx()][PieceKind::Rook.idx()];
+        while rooks != 0 {
+            let idx = rooks.trailing_zeros() as u8;
+            rooks &= rooks - 1;
+            let from = Square::from_index(idx);
+            let mut targets =
+                sliding_attacks_from(from, occupancy, &ROOK_DIRS) & !friendly_occ;
+            targets &= response_mask & pin_masks[idx as usize];
+            for_each_bit(targets, |target| buffer.push(Move::new(from, target)));
+        }
+
+        let mut queens = self.piece_bitboards[color.idx()][PieceKind::Queen.idx()];
+        while queens != 0 {
+            let idx = queens.trailing_zeros() as u8;
+            queens &= queens - 1;
+            let from = Square::from_index(idx);
+            let mut targets = (sliding_attacks_from(from, occupancy, &BISHOP_DIRS)
+                | sliding_attacks_from(from, occupancy, &ROOK_DIRS))
+                & !friendly_occ;
+            targets &= response_mask & pin_masks[idx as usize];
+            for_each_bit(targets, |target| buffer.push(Move::new(from, target)));
+        }
     }
 
-    fn generate_knight_moves(
+    fn compute_pin_masks(
         &self,
-        square: Square,
         color: Color,
-        buffer: &mut MoveList,
+        king_square: Square,
+        bishop_sliders: Bitboard,
+        rook_sliders: Bitboard,
+        pin_masks: &mut [Bitboard; 64],
     ) {
-        let attacks = knight_attacks(square) & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
+        self.detect_pins_in_dirs(
+            color,
+            king_square,
+            bishop_sliders,
+            &BISHOP_DIRS,
+            pin_masks,
+        );
+        self.detect_pins_in_dirs(
+            color,
+            king_square,
+            rook_sliders,
+            &ROOK_DIRS,
+            pin_masks,
+        );
     }
 
-    fn generate_sliding_moves(
+    fn detect_pins_in_dirs(
         &self,
-        square: Square,
         color: Color,
-        buffer: &mut MoveList,
-        directions: &[(i8, i8)],
+        king_square: Square,
+        enemy_sliders: Bitboard,
+        dirs: &[(i8, i8)],
+        pin_masks: &mut [Bitboard; 64],
     ) {
-        let attacks = sliding_attacks_from(square, self.occupancy, directions)
-            & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
-    }
-
-    fn generate_king_moves(
-        &self,
-        square: Square,
-        color: Color,
-        buffer: &mut MoveList,
-    ) {
-        let attacks = king_attacks(square) & !self.occupancy_by_color[color.idx()];
-        for_each_bit(attacks, |target| buffer.push(Move::new(square, target)));
+        let friendly_occ = self.occupancy_by_color[color.idx()];
+        let enemy_occ = self.occupancy_by_color[color.opponent().idx()];
+        for &(dr, df) in dirs {
+            let mut current = king_square;
+            let mut blocker: Option<Square> = None;
+            while let Some(next) = current.offset(dr, df) {
+                let mask = square_bitboard(next);
+                if friendly_occ & mask != 0 {
+                    if blocker.is_none() {
+                        blocker = Some(next);
+                    } else {
+                        break;
+                    }
+                } else if enemy_occ & mask != 0 {
+                    if enemy_sliders & mask != 0 {
+                        if let Some(block_sq) = blocker {
+                            let line_mask = (ray_mask_from(block_sq, dr, df)
+                                | ray_mask_from(block_sq, -dr, -df))
+                                & !square_bitboard(king_square);
+                            pin_masks[block_sq.to_index()] = line_mask;
+                        }
+                    }
+                    break;
+                }
+                current = next;
+            }
+        }
     }
 
     pub fn static_exchange_eval(&self, mv: Move) -> i32 {

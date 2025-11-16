@@ -1,9 +1,9 @@
 use crate::chess::Board;
 use crate::nnue::{self, NnueConfig, NnueLayers};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::convert::TryInto;
 use std::path::Path;
-use tch::{Device, Tensor, nn};
+use tch::{nn, Device, Tensor};
 
 pub struct NnueRuntime {
     view: SparseAccumulatorRuntime,
