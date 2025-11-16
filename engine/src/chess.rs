@@ -1416,9 +1416,8 @@ impl Board {
             return false;
         }
 
-        if let Some(dest_piece) = self.piece_at(mv.to)
-            && dest_piece.color == piece.color
-        {
+        let dp = self.piece_at(mv.to);
+        if dp.is_some() && dp.unwrap().color == piece.color {
             return false;
         }
 
@@ -1532,10 +1531,10 @@ impl Board {
             Self::disable_rook_castling(&mut rights, mv.from, moving.color);
         }
 
-        if let Some(captured_piece) = captured
-            && captured_piece.kind == PieceKind::Rook
+        let cp = self.piece_at(mv.to);
+        if cp.is_some() && cp.unwrap().kind == PieceKind::Rook
         {
-            Self::disable_rook_castling(&mut rights, mv.to, captured_piece.color);
+            Self::disable_rook_castling(&mut rights, mv.to, cp.unwrap().color);
         }
 
         if rights != self.castling_rights {
