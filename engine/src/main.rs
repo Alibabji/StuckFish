@@ -76,13 +76,6 @@ fn main() -> Result<()> {
                     ponder = start_ponder(&board, bm, nnue_runner.clone());
                 }
             }
-            Some("newgame") => {
-                if let Some(handle) = ponder.take() {
-                    handle.stop();
-                }
-                tt.clear();
-                println!("newgame ready");
-            }
             _ => break,
         }
     }

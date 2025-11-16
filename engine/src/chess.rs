@@ -486,7 +486,12 @@ impl Move {
     }
 
     pub fn to_uci(self) -> String {
-        format!("{}{}", self.from.to_algebraic(), self.to.to_algebraic())
+        let mut text =
+            format!("{}{}", self.from.to_algebraic(), self.to.to_algebraic());
+        if self.is_promotion() {
+            text.push('q');
+        }
+        text
     }
 
     pub const fn empty() -> Self {
@@ -494,6 +499,11 @@ impl Move {
             from: Square::unchecked(0, 0),
             to: Square::unchecked(0, 0),
         }
+    }
+
+    pub fn is_promotion(self) -> bool {
+        (self.from.rank() == 6 && self.to.rank() == 7)
+            || (self.from.rank() == 1 && self.to.rank() == 0)
     }
 }
 
@@ -2066,6 +2076,14 @@ mod tests {
         assert_eq!(features[idx((0, 4), PieceKind::King, true)], 1.0);
         // Black king on e8
         assert_eq!(features[idx((7, 4), PieceKind::King, false)], 1.0);
+    }
+
+    #[test]
+    fn promotion_move_to_uci_includes_suffix() {
+        let mv = Move::new(Square::unchecked(6, 0), Square::unchecked(7, 0));
+        assert_eq!(mv.to_uci(), "a7a8q");
+        let capture = Move::new(Square::unchecked(1, 5), Square::unchecked(0, 4));
+        assert_eq!(capture.to_uci(), "f2e1q");
     }
 
     #[test]
