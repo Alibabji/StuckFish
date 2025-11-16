@@ -28,6 +28,7 @@ fn main() -> Result<()> {
     let nnue_runner = Arc::new(NnueRuntime::new(cmd_args.nnue_path)?);
     let mut tt = TranspositionTable::new(16);
     let mut ponder: Option<PonderHandle> = None;
+    let mut history = GameHistory::new();
     let time_manager = TimeManager::default();
     loop {
         let mut cmdline = String::new();
@@ -44,6 +45,7 @@ fn main() -> Result<()> {
                 let fen = &cmdline[(time_left.len() + 4)..];
                 let mut board = Board::from_fen(fen)?;
                 let position_hash = board.hash();
+                history.observe(&board);
 
                 let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
                 let default_budget = TimeBudget {
@@ -80,6 +82,7 @@ fn main() -> Result<()> {
                                     Some(refined_budget),
                                     nnue_runner.as_ref(),
                                     None,
+                                    history.as_slice(),
                                 );
                                 if refined.depth >= ponder_sr.depth {
                                     refined
@@ -96,8 +99,12 @@ fn main() -> Result<()> {
                             );
                             if let Some(bm) = final_report.best_move {
                                 println!("{}", bm.to_uci());
-                                ponder =
-                                    start_ponder(&board, bm, nnue_runner.clone());
+                                ponder = start_ponder(
+                                    &board,
+                                    bm,
+                                    nnue_runner.clone(),
+                                    history.as_slice(),
+                                );
                             }
                             continue;
                         }
@@ -113,11 +120,17 @@ fn main() -> Result<()> {
                     Some(think_time),
                     nnue_runner.as_ref(),
                     None,
+                    history.as_slice(),
                 );
                 eprintln!("{:?}, nps: {}", sr, sr.nps());
                 if let Some(bm) = sr.best_move {
                     println!("{}", bm.to_uci());
-                    ponder = start_ponder(&board, bm, nnue_runner.clone());
+                    ponder = start_ponder(
+                        &board,
+                        bm,
+                        nnue_runner.clone(),
+                        history.as_slice(),
+                    );
                 }
             }
             Some("newgame") => {
@@ -125,6 +138,7 @@ fn main() -> Result<()> {
                     handle.abort();
                 }
                 tt.clear();
+                history.clear();
                 println!("newgame ready");
             }
             _ => break,
@@ -168,11 +182,15 @@ fn start_ponder(
     current_board: &Board,
     our_move: Move,
     nnue: Arc<NnueRuntime>,
+    history: &[u64],
 ) -> Option<PonderHandle> {
     let mut board_after = current_board.clone();
     if !board_after.play_move(our_move) {
         return None;
     }
+
+    let mut ponder_history = history.to_vec();
+    append_history(&mut ponder_history, &board_after);
 
     let mut reply_board = board_after.clone();
     let mut tmp_tt = TranspositionTable::new(16);
@@ -187,11 +205,13 @@ fn start_ponder(
         Some(quick_budget),
         nnue.as_ref(),
         None,
+        &ponder_history,
     );
     let reply = reply_report.best_move?;
     if !board_after.play_move(reply) {
         return None;
     }
+    append_history(&mut ponder_history, &board_after);
 
     let target_hash = board_after.hash();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -213,6 +233,7 @@ fn start_ponder(
             Some(ponder_budget),
             nnue_clone.as_ref(),
             Some(stop_clone),
+            &ponder_history,
         );
         let _ = tx.send(report);
     });
@@ -223,4 +244,40 @@ fn start_ponder(
         result_rx: rx,
         handle: Some(handle),
     })
+}
+
+fn append_history(history: &mut Vec<u64>, board: &Board) {
+    if board.halfmove_clock == 0 {
+        history.clear();
+    }
+    history.push(board.hash());
+    let max_len = board.halfmove_clock as usize + 1;
+    if history.len() > max_len {
+        let remove = history.len() - max_len;
+        history.drain(0..remove);
+    }
+}
+
+struct GameHistory {
+    positions: Vec<u64>,
+}
+
+impl GameHistory {
+    fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.positions.clear();
+    }
+
+    fn observe(&mut self, board: &Board) {
+        append_history(&mut self.positions, board);
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        &self.positions
+    }
 }

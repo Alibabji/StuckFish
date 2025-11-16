@@ -24,6 +24,7 @@ struct SearchState {
     hard_deadline: Option<Instant>,
     abort_flag: Option<Arc<AtomicBool>>,
     stopped: bool,
+    repetition: RepetitionTracker,
 }
 
 fn move_indices(mv: Move) -> (usize, usize) {
@@ -36,7 +37,13 @@ impl SearchState {
     fn new(
         deadlines: Option<(Instant, Instant)>,
         abort_flag: Option<Arc<AtomicBool>>,
+        repetition_history: &[u64],
+        current_hash: u64,
     ) -> Self {
+        let mut repetition = RepetitionTracker::new(repetition_history);
+        if repetition.history.last().copied() != Some(current_hash) {
+            repetition.history.push(current_hash);
+        }
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
@@ -44,6 +51,7 @@ impl SearchState {
             hard_deadline: deadlines.map(|d| d.1),
             abort_flag,
             stopped: false,
+            repetition,
         }
     }
 
@@ -97,6 +105,60 @@ impl SearchState {
             }
         }
         false
+    }
+
+    fn push_repetition(&mut self, hash: u64, irreversible: bool) {
+        self.repetition.push(hash, irreversible);
+    }
+
+    fn pop_repetition(&mut self) {
+        self.repetition.pop();
+    }
+
+    fn is_threefold(&self, hash: u64) -> bool {
+        self.repetition.is_threefold(hash)
+    }
+}
+
+#[derive(Clone)]
+struct RepetitionTracker {
+    history: Vec<u64>,
+    reset_stack: Vec<usize>,
+    current_reset: usize,
+}
+
+impl RepetitionTracker {
+    fn new(base: &[u64]) -> Self {
+        Self {
+            history: base.to_vec(),
+            reset_stack: Vec::new(),
+            current_reset: 0,
+        }
+    }
+
+    fn push(&mut self, hash: u64, irreversible: bool) {
+        self.reset_stack.push(self.current_reset);
+        self.history.push(hash);
+        if irreversible {
+            self.current_reset = self.history.len().saturating_sub(1);
+        }
+    }
+
+    fn pop(&mut self) {
+        if !self.history.is_empty() {
+            self.history.pop();
+        }
+        if let Some(prev) = self.reset_stack.pop() {
+            self.current_reset = prev;
+        }
+    }
+
+    fn is_threefold(&self, hash: u64) -> bool {
+        self.history[self.current_reset..]
+            .iter()
+            .filter(|&&h| h == hash)
+            .count()
+            >= 3
     }
 }
 
@@ -156,6 +218,7 @@ pub fn search_best_move(
     time_budget: Option<TimeBudget>,
     nnue_runner: &NnueRuntime,
     abort_flag: Option<Arc<AtomicBool>>,
+    repetition_history: &[u64],
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
@@ -171,7 +234,12 @@ pub fn search_best_move(
 
     let start = Instant::now();
     let deadlines = time_budget.map(|b| (start + b.optimal, start + b.maximum));
-    let mut state = SearchState::new(deadlines, abort_flag.clone());
+    let mut state = SearchState::new(
+        deadlines,
+        abort_flag.clone(),
+        repetition_history,
+        board.hash(),
+    );
 
     let mut best_move = None;
     let mut completed_depth = 0;
@@ -260,6 +328,9 @@ fn search_single_depth(
     for &mv in root_moves.iter() {
         move_count += 1;
         let undo = ctx.board.make_move(mv);
+        let irreversible = undo.moving_piece.kind == PieceKind::Pawn
+            || undo.captured_piece.is_some();
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
         let mut score;
         if move_count == 1 {
             score = -negamax(
@@ -283,6 +354,7 @@ fn search_single_depth(
                 );
             }
         }
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
         if score > best_score {
             best_score = score;
@@ -308,6 +380,9 @@ fn negamax(
         return 0;
     }
     ctx.stats.record_node();
+    if ctx.state.is_threefold(ctx.board.hash()) {
+        return 0;
+    }
 
     let alpha_orig = window.alpha;
     let beta_orig = window.beta;
@@ -369,10 +444,12 @@ fn negamax(
         move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
-        if is_capture && depth > 0 && ctx.board.static_exchange_eval(mv) < 0 {
+        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -50 {
             ctx.board.unmake_move(undo);
             continue;
         }
+        let irreversible = is_capture || undo.moving_piece.kind == PieceKind::Pawn;
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
         let gives_check = ctx.board.is_in_check(ctx.board.active_color);
         let mut child_depth = depth.saturating_sub(1);
         let mut reduced = false;
@@ -406,6 +483,7 @@ fn negamax(
                 );
             }
         }
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
         if score > best_value {
             best_value = score;
@@ -437,6 +515,9 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         return window.alpha;
     }
     ctx.stats.record_node();
+    if ctx.state.is_threefold(ctx.board.hash()) {
+        return 0;
+    }
 
     let stand_pat = ctx.nnue_runner.eval(ctx.board).unwrap_or(-MATE_VALUE);
     if stand_pat >= window.beta {
@@ -459,12 +540,16 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         if ctx.board.piece_at(mv.to).is_none() {
             continue;
         }
-        if ctx.board.static_exchange_eval(mv) < 0 {
+        if ctx.board.static_exchange_eval(mv) < -50 {
             continue;
         }
         let undo = ctx.board.make_move(mv);
+        let irreversible = undo.captured_piece.is_some()
+            || undo.moving_piece.kind == PieceKind::Pawn;
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
         let score =
             -quiescence(ctx, SearchWindow::new(-window.beta, -window.alpha), ply + 1);
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
 
         if score >= window.beta {
