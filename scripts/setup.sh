@@ -9,7 +9,6 @@ if ! type rustup > /dev/null; then
 else
     echo "Rust is already installed."
 fi
-. "$HOME/.cargo/env"
 
 echo "Checking libtorch"
 if [ -d "./libtorch" ]; then
@@ -29,5 +28,6 @@ export PATH="$LIBTORCH/bin${PATH:+:${PATH}}"
 export LD_LIBRARY_PATH="$LIBTORCH/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 cd engine
+. "$HOME/.cargo/env"
 cargo build --release --bin suckfish
 cp target/release/suckfish ../
