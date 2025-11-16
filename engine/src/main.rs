@@ -32,20 +32,51 @@ fn main() -> Result<()> {
     let time_manager = TimeManager::default();
     loop {
         let mut cmdline = String::new();
-        std::io::stdin().read_line(&mut cmdline)?;
-        let mut cmd_parsed = cmdline.split(" ");
-        let cmd = cmd_parsed.next();
+        if std::io::stdin().read_line(&mut cmdline)? == 0 {
+            break;
+        }
+        let trimmed = cmdline.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut idx = 0;
+        let bytes = trimmed.as_bytes();
+        while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let cmd = &trimmed[..idx];
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let time_start = idx;
+        while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let time_slice = &trimmed[time_start..idx];
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let fen_slice = if idx < bytes.len() {
+            &trimmed[idx..]
+        } else {
+            ""
+        };
+
         match cmd {
-            Some("go") => {
-                let time_left = if let Some(tl) = cmd_parsed.next() {
-                    tl.to_string()
-                } else {
+            "go" => {
+                if fen_slice.is_empty() {
                     continue;
+                }
+                let time_left = if time_slice.is_empty() {
+                    "0"
+                } else {
+                    time_slice
                 };
-                let fen = &cmdline[(time_left.len() + 4)..];
+                let fen = fen_slice;
                 let mut board = Board::from_fen(fen)?;
+                history.reset(&board);
                 let position_hash = board.hash();
-                history.observe(&board);
 
                 let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
                 let default_budget = TimeBudget {
@@ -133,7 +164,7 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            Some("newgame") => {
+            "newgame" => {
                 if let Some(handle) = ponder.take() {
                     handle.abort();
                 }
@@ -269,12 +300,13 @@ impl GameHistory {
         }
     }
 
-    fn clear(&mut self) {
+    fn reset(&mut self, board: &Board) {
         self.positions.clear();
+        append_history(&mut self.positions, board);
     }
 
-    fn observe(&mut self, board: &Board) {
-        append_history(&mut self.positions, board);
+    fn clear(&mut self) {
+        self.positions.clear();
     }
 
     fn as_slice(&self) -> &[u64] {
