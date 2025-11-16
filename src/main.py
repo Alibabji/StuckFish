@@ -29,7 +29,7 @@ old_ld = os.environ.get("LD_LIBRARY_PATH", "")
 os.environ["LD_LIBRARY_PATH"] = f"{LIBTORCH}/lib" + (f":{old_ld}" if old_ld else "")
 
 engine = subprocess.Popen(
-    [os.path.join(os.getcwd(), 'suckfish'), '--nnue-path', 'nnue.ot'],
+    [os.path.join(os.getcwd(), 'suckfish'), '--nnue-path', os.path.join(os.getcwd(), 'nnue.ot')],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.DEVNULL,
