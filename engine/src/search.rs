@@ -456,7 +456,8 @@ fn negamax(
         move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
-        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -SEE_RANGE {
+        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -SEE_RANGE
+        {
             ctx.board.unmake_move(undo);
             continue;
         }
