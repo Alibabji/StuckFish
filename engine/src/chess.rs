@@ -1156,6 +1156,17 @@ impl Board {
         self.zobrist
     }
 
+    pub fn material_count(&self) -> i32 {
+        let mut total = 0;
+        for color_idx in 0..2 {
+            for kind in PieceKind::all() {
+                let bb = self.piece_bitboards[color_idx][kind.idx()];
+                total += piece_value(kind) * bb.count_ones() as i32;
+            }
+        }
+        total
+    }
+
     fn rebuild_nnue_state(&mut self) {
         let mut white = NnueAccumulator::new(Color::White);
         white.rebuild(self);
