@@ -1,15 +1,17 @@
-use crate::chess::{Board, Move, MoveList, PieceKind, piece_value};
+use crate::chess::{piece_value, Board, Move, MoveList, PieceKind};
 use crate::nnue_runtime::NnueRuntime;
 use crate::time_manager::TimeBudget;
 use crate::tt::{Bound, TranspositionTable};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
+const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
 const MAX_PLY: usize = 64;
+const SEE_RANGE: i32 = 100;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
@@ -24,6 +26,8 @@ struct SearchState {
     hard_deadline: Option<Instant>,
     abort_flag: Option<Arc<AtomicBool>>,
     stopped: bool,
+    repetition: RepetitionTracker,
+    endgame: bool,
 }
 
 fn move_indices(mv: Move) -> (usize, usize) {
@@ -36,7 +40,15 @@ impl SearchState {
     fn new(
         deadlines: Option<(Instant, Instant)>,
         abort_flag: Option<Arc<AtomicBool>>,
+        repetition_history: &[u64],
+        current_hash: u64,
+        material: i32,
     ) -> Self {
+        let mut repetition = RepetitionTracker::new(repetition_history);
+        if repetition.history.last().copied() != Some(current_hash) {
+            repetition.history.push(current_hash);
+        }
+        let endgame = material <= ENDGAME_MATERIAL_THRESHOLD;
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
@@ -44,6 +56,8 @@ impl SearchState {
             hard_deadline: deadlines.map(|d| d.1),
             abort_flag,
             stopped: false,
+            repetition,
+            endgame,
         }
     }
 
@@ -97,6 +111,64 @@ impl SearchState {
             }
         }
         false
+    }
+
+    fn push_repetition(&mut self, hash: u64, irreversible: bool) {
+        self.repetition.push(hash, irreversible);
+    }
+
+    fn pop_repetition(&mut self) {
+        self.repetition.pop();
+    }
+
+    fn is_threefold(&self, hash: u64) -> bool {
+        self.repetition.is_threefold(hash)
+    }
+
+    fn in_endgame(&self) -> bool {
+        self.endgame
+    }
+}
+
+#[derive(Clone)]
+struct RepetitionTracker {
+    history: Vec<u64>,
+    reset_stack: Vec<usize>,
+    current_reset: usize,
+}
+
+impl RepetitionTracker {
+    fn new(base: &[u64]) -> Self {
+        Self {
+            history: base.to_vec(),
+            reset_stack: Vec::new(),
+            current_reset: 0,
+        }
+    }
+
+    fn push(&mut self, hash: u64, irreversible: bool) {
+        self.reset_stack.push(self.current_reset);
+        self.history.push(hash);
+        if irreversible {
+            self.current_reset = self.history.len().saturating_sub(1);
+        }
+    }
+
+    fn pop(&mut self) {
+        if !self.history.is_empty() {
+            self.history.pop();
+        }
+        if let Some(prev) = self.reset_stack.pop() {
+            self.current_reset = prev;
+        }
+    }
+
+    fn is_threefold(&self, hash: u64) -> bool {
+        self.history[self.current_reset..]
+            .iter()
+            .filter(|&&h| h == hash)
+            .count()
+            >= 3
     }
 }
 
@@ -156,6 +228,7 @@ pub fn search_best_move(
     time_budget: Option<TimeBudget>,
     nnue_runner: &NnueRuntime,
     abort_flag: Option<Arc<AtomicBool>>,
+    repetition_history: &[u64],
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
@@ -171,12 +244,18 @@ pub fn search_best_move(
 
     let start = Instant::now();
     let deadlines = time_budget.map(|b| (start + b.optimal, start + b.maximum));
-    let mut state = SearchState::new(deadlines, abort_flag.clone());
+    let mut state = SearchState::new(
+        deadlines,
+        abort_flag.clone(),
+        repetition_history,
+        board.hash(),
+        board.material_count(),
+    );
 
     let mut best_move = None;
     let mut completed_depth = 0;
     let mut last_score = 0;
-    const ASP_WINDOW: i32 = 50;
+    const ASP_WINDOW: i32 = 100;
 
     {
         let mut ctx = SearchContext {
@@ -243,22 +322,50 @@ fn search_single_depth(
     preferred: Option<Move>,
     window: SearchWindow,
 ) -> (Option<Move>, i32) {
-    let tt_move = ctx.tt.probe(ctx.board.hash()).and_then(|entry| entry.best_move);
+    let tt_move = ctx
+        .tt
+        .probe(ctx.board.hash())
+        .and_then(|entry| entry.best_move);
     let killers = ctx.state.killer_moves(0);
-    order_moves(ctx.board, root_moves, preferred, tt_move, killers, ctx.state);
+    order_moves(
+        ctx.board, root_moves, preferred, tt_move, killers, ctx.state,
+    );
 
     let mut best_move = None;
     let mut best_score = -MATE_VALUE;
     let mut bounds = window;
+    let mut move_count = 0;
 
     for &mv in root_moves.iter() {
+        move_count += 1;
         let undo = ctx.board.make_move(mv);
-        let score = -negamax(
-            ctx,
-            depth.saturating_sub(1),
-            SearchWindow::new(-bounds.beta, -bounds.alpha),
-            1,
-        );
+        let irreversible = undo.moving_piece.kind == PieceKind::Pawn
+            || undo.captured_piece.is_some();
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
+        let mut score;
+        if move_count == 1 {
+            score = -negamax(
+                ctx,
+                depth.saturating_sub(1),
+                SearchWindow::new(-bounds.beta, -bounds.alpha),
+                1,
+                true,
+            );
+        } else {
+            let narrow =
+                SearchWindow::new(-bounds.alpha.saturating_add(1), -bounds.alpha);
+            score = -negamax(ctx, depth.saturating_sub(1), narrow, 1, false);
+            if score > bounds.alpha && score < bounds.beta {
+                score = -negamax(
+                    ctx,
+                    depth.saturating_sub(1),
+                    SearchWindow::new(-bounds.beta, -bounds.alpha),
+                    1,
+                    true,
+                );
+            }
+        }
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
         if score > best_score {
             best_score = score;
@@ -278,11 +385,15 @@ fn negamax(
     depth: u8,
     mut window: SearchWindow,
     ply: usize,
+    is_pv: bool,
 ) -> i32 {
     if ctx.state.should_stop() {
         return 0;
     }
     ctx.stats.record_node();
+    if ctx.state.is_threefold(ctx.board.hash()) {
+        return 0;
+    }
 
     let alpha_orig = window.alpha;
     let beta_orig = window.beta;
@@ -308,7 +419,9 @@ fn negamax(
     }
 
     const NULL_MOVE_REDUCTION: u8 = 2;
-    if depth > NULL_MOVE_REDUCTION + 1 && !ctx.board.is_in_check(ctx.board.active_color)
+    if depth > NULL_MOVE_REDUCTION + 1
+        && !ctx.board.is_in_check(ctx.board.active_color)
+        && !ctx.state.in_endgame()
     {
         let undo = ctx.board.make_null_move();
         let score = -negamax(
@@ -316,6 +429,7 @@ fn negamax(
             depth - 1 - NULL_MOVE_REDUCTION,
             SearchWindow::new(-window.beta, -window.beta + 1),
             ply + 1,
+            false,
         );
         ctx.board.unmake_null_move(undo);
         if score >= window.beta {
@@ -337,19 +451,56 @@ fn negamax(
 
     let mut best_value = -MATE_VALUE;
     let mut best_move = None;
+    let mut move_count = 0;
     for &mv in moves.as_slice() {
+        move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
-        if is_capture && depth > 0 && ctx.board.static_exchange_eval(mv) < 0 {
+        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -SEE_RANGE {
             ctx.board.unmake_move(undo);
             continue;
         }
-        let score = -negamax(
-            ctx,
-            depth.saturating_sub(1),
-            window.flipped(),
-            ply + 1,
-        );
+        let irreversible = is_capture || undo.moving_piece.kind == PieceKind::Pawn;
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
+        let gives_check = ctx.board.is_in_check(ctx.board.active_color);
+        let mut child_depth = depth.saturating_sub(1);
+        let mut reduced = false;
+        let child_is_pv = is_pv && move_count == 1;
+        if depth >= 3
+            && move_count > 1
+            && !is_capture
+            && !gives_check
+            && !child_is_pv
+            && !ctx.state.in_endgame()
+        {
+            reduced = true;
+            let reduction = 1 + (move_count > 6) as u8 + (depth > 5) as u8;
+            child_depth = child_depth.saturating_sub(reduction);
+        }
+        let mut score;
+        if child_is_pv {
+            score = -negamax(ctx, child_depth, window.flipped(), ply + 1, true);
+        } else {
+            let narrow =
+                SearchWindow::new(-window.alpha.saturating_add(1), -window.alpha);
+            score = -negamax(ctx, child_depth, narrow, ply + 1, false);
+            if reduced && score > window.alpha {
+                child_depth = depth.saturating_sub(1);
+                let retry =
+                    SearchWindow::new(-window.alpha.saturating_add(1), -window.alpha);
+                score = -negamax(ctx, child_depth, retry, ply + 1, false);
+            }
+            if score > window.alpha && score < window.beta {
+                score = -negamax(
+                    ctx,
+                    depth.saturating_sub(1),
+                    window.flipped(),
+                    ply + 1,
+                    true,
+                );
+            }
+        }
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
         if score > best_value {
             best_value = score;
@@ -381,6 +532,9 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         return window.alpha;
     }
     ctx.stats.record_node();
+    if ctx.state.is_threefold(ctx.board.hash()) {
+        return 0;
+    }
 
     let stand_pat = ctx.nnue_runner.eval(ctx.board).unwrap_or(-MATE_VALUE);
     if stand_pat >= window.beta {
@@ -392,7 +546,10 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
 
     let mut moves = MoveList::new();
     ctx.board.legal_moves_into(&mut moves);
-    let tt_move = ctx.tt.probe(ctx.board.hash()).and_then(|entry| entry.best_move);
+    let tt_move = ctx
+        .tt
+        .probe(ctx.board.hash())
+        .and_then(|entry| entry.best_move);
     let killers = ctx.state.killer_moves(ply);
     order_moves(ctx.board, &mut moves, None, tt_move, killers, ctx.state);
 
@@ -400,15 +557,16 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         if ctx.board.piece_at(mv.to).is_none() {
             continue;
         }
-        if ctx.board.static_exchange_eval(mv) < 0 {
+        if ctx.board.static_exchange_eval(mv) < -SEE_RANGE {
             continue;
         }
         let undo = ctx.board.make_move(mv);
-        let score = -quiescence(
-            ctx,
-            SearchWindow::new(-window.beta, -window.alpha),
-            ply + 1,
-        );
+        let irreversible = undo.captured_piece.is_some()
+            || undo.moving_piece.kind == PieceKind::Pawn;
+        ctx.state.push_repetition(ctx.board.hash(), irreversible);
+        let score =
+            -quiescence(ctx, SearchWindow::new(-window.beta, -window.alpha), ply + 1);
+        ctx.state.pop_repetition();
         ctx.board.unmake_move(undo);
 
         if score >= window.beta {
