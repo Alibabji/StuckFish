@@ -273,15 +273,15 @@ fn knight_masks() -> &'static [Bitboard; 64] {
     static KNIGHT: OnceLock<[Bitboard; 64]> = OnceLock::new();
     KNIGHT.get_or_init(|| {
         let mut table = [0_u64; 64];
-        for idx in 0..64 {
+        for (idx, entry) in table.iter_mut().enumerate() {
             let sq = Square::from_index(idx as u8);
             let mut mask = 0;
             for (dr, df) in KNIGHT_DELTAS {
-                if let Some(target) = sq.offset(dr as i8, df as i8) {
+                if let Some(target) = sq.offset(dr, df) {
                     mask |= square_bitboard(target);
                 }
             }
-            table[idx] = mask;
+            *entry = mask;
         }
         table
     })
@@ -291,7 +291,7 @@ fn king_masks() -> &'static [Bitboard; 64] {
     static KING: OnceLock<[Bitboard; 64]> = OnceLock::new();
     KING.get_or_init(|| {
         let mut table = [0_u64; 64];
-        for idx in 0..64 {
+        for (idx, entry) in table.iter_mut().enumerate() {
             let sq = Square::from_index(idx as u8);
             let mut mask = 0;
             for (dr, df) in KING_DELTAS {
@@ -299,7 +299,7 @@ fn king_masks() -> &'static [Bitboard; 64] {
                     mask |= square_bitboard(target);
                 }
             }
-            table[idx] = mask;
+            *entry = mask;
         }
         table
     })
@@ -309,7 +309,7 @@ fn pawn_attack_masks() -> &'static [[Bitboard; 64]; 2] {
     static MASKS: OnceLock<[[Bitboard; 64]; 2]> = OnceLock::new();
     MASKS.get_or_init(|| {
         let mut table = [[0_u64; 64]; 2];
-        for idx in 0..64 {
+        for (idx, entry) in table[Color::White.idx()].iter_mut().enumerate() {
             let sq = Square::from_index(idx as u8);
             let mut white_mask = 0;
             for df in [-1, 1] {
@@ -317,15 +317,17 @@ fn pawn_attack_masks() -> &'static [[Bitboard; 64]; 2] {
                     white_mask |= square_bitboard(target);
                 }
             }
-            table[Color::White.idx()][idx] = white_mask;
-
+            *entry = white_mask;
+        }
+        for (idx, entry) in table[Color::Black.idx()].iter_mut().enumerate() {
+            let sq = Square::from_index(idx as u8);
             let mut black_mask = 0;
             for df in [-1, 1] {
                 if let Some(target) = sq.offset(-1, df) {
                     black_mask |= square_bitboard(target);
                 }
             }
-            table[Color::Black.idx()][idx] = black_mask;
+            *entry = black_mask;
         }
         table
     })
@@ -382,10 +384,10 @@ impl ZobristKeys {
     fn new() -> Self {
         let mut rng = SplitMix64::new(0xDEAD_BEEF_F00D_BAAD);
         let mut pieces = [[[0_u64; 64]; 6]; 2];
-        for color in 0..2 {
-            for kind in 0..6 {
-                for square in 0..64 {
-                    pieces[color][kind][square] = rng.next_u64();
+        for color in &mut pieces {
+            for kind in color.iter_mut() {
+                for square in kind.iter_mut() {
+                    *square = rng.next_u64();
                 }
             }
         }
@@ -601,6 +603,44 @@ fn smallest_attacker_from(
     None
 }
 
+fn square_attacked_state(
+    square: Square,
+    by: Color,
+    bitboards: &[[Bitboard; 6]; 2],
+    occupancy: Bitboard,
+) -> bool {
+    let idx = by.idx();
+    let pawns = bitboards[idx][PieceKind::Pawn.idx()];
+    if pawns & pawn_attacks(square, by.opponent()) != 0 {
+        return true;
+    }
+
+    let knights = bitboards[idx][PieceKind::Knight.idx()];
+    if knights & knight_attacks(square) != 0 {
+        return true;
+    }
+
+    let king = bitboards[idx][PieceKind::King.idx()];
+    if king & king_attacks(square) != 0 {
+        return true;
+    }
+
+    let bishops = bitboards[idx][PieceKind::Bishop.idx()];
+    let rooks = bitboards[idx][PieceKind::Rook.idx()];
+    let queens = bitboards[idx][PieceKind::Queen.idx()];
+
+    if sliding_attacks_from(square, occupancy, &BISHOP_DIRS) & (bishops | queens) != 0
+    {
+        return true;
+    }
+
+    if sliding_attacks_from(square, occupancy, &ROOK_DIRS) & (rooks | queens) != 0 {
+        return true;
+    }
+
+    false
+}
+
 #[derive(Clone)]
 pub struct Board {
     piece_bitboards: [[Bitboard; 6]; 2],
@@ -662,6 +702,12 @@ impl MoveList {
 
     pub fn contains(&self, mv: &Move) -> bool {
         self.as_slice().contains(mv)
+    }
+}
+
+impl Default for MoveList {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1203,17 +1249,17 @@ impl Board {
                 let idx = bb.trailing_zeros() as u8;
                 bb &= bb - 1;
                 let square = Square::from_index(idx);
+                pseudo.clear();
                 self.generate_moves_for_piece(
                     square,
                     Piece::new(color, kind),
                     &mut pseudo,
                 );
-            }
-        }
-
-        for mv in pseudo.iter() {
-            if self.move_is_legal_mut(*mv) {
-                buffer.push(*mv);
+                for mv in pseudo.iter() {
+                    if self.move_is_legal(*mv) {
+                        buffer.push(*mv);
+                    }
+                }
             }
         }
     }
@@ -1402,11 +1448,6 @@ impl Board {
     }
 
     pub fn move_is_legal(&self, mv: Move) -> bool {
-        let mut clone = self.clone();
-        clone.move_is_legal_mut(mv)
-    }
-
-    fn move_is_legal_mut(&mut self, mv: Move) -> bool {
         let piece = match self.piece_at(mv.from) {
             Some(piece) => piece,
             None => return false,
@@ -1416,16 +1457,58 @@ impl Board {
             return false;
         }
 
-        if let Some(dest_piece) = self.piece_at(mv.to)
-            && dest_piece.color == piece.color
-        {
-            return false;
+        let captured = self.piece_at(mv.to);
+        if let Some(dest) = captured {
+            if dest.color == piece.color {
+                return false;
+            }
         }
 
-        let undo = self.make_move_internal(mv, piece);
-        let legal = !self.is_in_check(self.active_color.opponent());
-        self.unmake_move(undo);
-        legal
+        self.move_is_legal_state(mv, piece, captured)
+    }
+
+    fn move_is_legal_state(
+        &self,
+        mv: Move,
+        piece: Piece,
+        captured: Option<Piece>,
+    ) -> bool {
+        let mut bitboards = self.piece_bitboards;
+        let mut occ_by_color = self.occupancy_by_color;
+        let mut occupancy = self.occupancy;
+
+        let from_mask = square_bitboard(mv.from);
+        let to_mask = square_bitboard(mv.to);
+
+        if let Some(captured_piece) = captured {
+            let idx = captured_piece.color.idx();
+            let kind = captured_piece.kind.idx();
+            bitboards[idx][kind] &= !to_mask;
+            occ_by_color[idx] &= !to_mask;
+            occupancy &= !to_mask;
+        }
+
+        let color_idx = piece.color.idx();
+        let kind_idx = piece.kind.idx();
+        bitboards[color_idx][kind_idx] &= !from_mask;
+        occ_by_color[color_idx] &= !from_mask;
+        occupancy &= !from_mask;
+
+        bitboards[color_idx][kind_idx] |= to_mask;
+        occ_by_color[color_idx] |= to_mask;
+        occupancy |= to_mask;
+
+        let king_bb = bitboards[color_idx][PieceKind::King.idx()];
+        if king_bb == 0 {
+            return false;
+        }
+        let king_square = Square::from_index(king_bb.trailing_zeros() as u8);
+        !square_attacked_state(
+            king_square,
+            piece.color.opponent(),
+            &bitboards,
+            occupancy,
+        )
     }
 
     pub(crate) fn make_move(&mut self, mv: Move) -> MoveUndo {
@@ -1532,10 +1615,10 @@ impl Board {
             Self::disable_rook_castling(&mut rights, mv.from, moving.color);
         }
 
-        if let Some(captured_piece) = captured
-            && captured_piece.kind == PieceKind::Rook
-        {
-            Self::disable_rook_castling(&mut rights, mv.to, captured_piece.color);
+        if let Some(cp) = captured {
+            if cp.kind == PieceKind::Rook {
+                Self::disable_rook_castling(&mut rights, mv.to, cp.color);
+            }
         }
 
         if rights != self.castling_rights {
@@ -1575,39 +1658,7 @@ impl Board {
     }
 
     fn square_attacked(&self, square: Square, by: Color) -> bool {
-        let idx = by.idx();
-        let occupancy = self.occupancy;
-        let pawns = self.piece_bitboards[idx][PieceKind::Pawn.idx()];
-        if pawns & pawn_attacks(square, by.opponent()) != 0 {
-            return true;
-        }
-
-        let knights = self.piece_bitboards[idx][PieceKind::Knight.idx()];
-        if knights & knight_attacks(square) != 0 {
-            return true;
-        }
-
-        let king = self.piece_bitboards[idx][PieceKind::King.idx()];
-        if king & king_attacks(square) != 0 {
-            return true;
-        }
-
-        let bishops = self.piece_bitboards[idx][PieceKind::Bishop.idx()];
-        let rooks = self.piece_bitboards[idx][PieceKind::Rook.idx()];
-        let queens = self.piece_bitboards[idx][PieceKind::Queen.idx()];
-
-        if sliding_attacks_from(square, occupancy, &BISHOP_DIRS) & (bishops | queens)
-            != 0
-        {
-            return true;
-        }
-
-        if sliding_attacks_from(square, occupancy, &ROOK_DIRS) & (rooks | queens) != 0
-        {
-            return true;
-        }
-
-        false
+        square_attacked_state(square, by, &self.piece_bitboards, self.occupancy)
     }
 
     pub fn halfka(&self) -> Result<Vec<f32>> {

@@ -198,16 +198,16 @@ pub fn train_from_csv(
                 let loss = train_batch(&network, &batch, device, &mut opt);
                 batches += 1;
                 samples_processed += batch.len();
-                log_progress(
-                    options.log_interval,
-                    batches,
-                    epoch + 1,
-                    options.epochs,
+                log_progress(&LogProgressArgs {
+                    interval: options.log_interval,
+                    batch_idx: batches,
+                    epoch: epoch + 1,
+                    total_epochs: options.epochs,
                     samples_processed,
-                    start.elapsed(),
+                    elapsed: start.elapsed(),
                     loss,
                     total_target,
-                );
+                });
                 batch.clear();
             }
 
@@ -220,16 +220,16 @@ pub fn train_from_csv(
             let loss = train_batch(&network, &batch, device, &mut opt);
             batches += 1;
             samples_processed += batch.len();
-            log_progress(
-                options.log_interval,
-                batches,
-                epoch + 1,
-                options.epochs,
+            log_progress(&LogProgressArgs {
+                interval: options.log_interval,
+                batch_idx: batches,
+                epoch: epoch + 1,
+                total_epochs: options.epochs,
                 samples_processed,
-                start.elapsed(),
+                elapsed: start.elapsed(),
                 loss,
                 total_target,
-            );
+            });
         }
 
         if consumed_this_epoch == 0 {
@@ -350,7 +350,7 @@ fn train_batch(
     loss.double_value(&[])
 }
 
-fn log_progress(
+struct LogProgressArgs {
     interval: usize,
     batch_idx: usize,
     epoch: usize,
@@ -359,22 +359,25 @@ fn log_progress(
     elapsed: Duration,
     loss: f64,
     total_target: Option<usize>,
-) {
-    if interval == 0 || !batch_idx.is_multiple_of(interval) {
+}
+
+fn log_progress(args: &LogProgressArgs) {
+    if args.interval == 0 || !args.batch_idx.is_multiple_of(args.interval) {
         return;
     }
-    let eta = total_target
-        .and_then(|goal| estimate_eta(elapsed, samples_processed, goal))
+    let eta = args
+        .total_target
+        .and_then(|goal| estimate_eta(args.elapsed, args.samples_processed, goal))
         .unwrap_or_else(|| "?".to_string());
     println!(
         "[epoch {}/{}] batch {} loss {:.4} elapsed {} eta {} samples {}",
-        epoch,
-        total_epochs,
-        batch_idx,
-        loss,
-        format_duration(elapsed),
+        args.epoch,
+        args.total_epochs,
+        args.batch_idx,
+        args.loss,
+        format_duration(args.elapsed),
         eta,
-        samples_processed
+        args.samples_processed
     );
 }
 
