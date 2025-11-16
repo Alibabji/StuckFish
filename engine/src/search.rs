@@ -9,6 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
+const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
 const MAX_PLY: usize = 64;
 const SEE_WINDOW: i32 = 100;
 
@@ -26,6 +27,7 @@ struct SearchState {
     abort_flag: Option<Arc<AtomicBool>>,
     stopped: bool,
     repetition: RepetitionTracker,
+    endgame: bool,
 }
 
 fn move_indices(mv: Move) -> (usize, usize) {
@@ -40,11 +42,13 @@ impl SearchState {
         abort_flag: Option<Arc<AtomicBool>>,
         repetition_history: &[u64],
         current_hash: u64,
+        material: i32,
     ) -> Self {
         let mut repetition = RepetitionTracker::new(repetition_history);
         if repetition.history.last().copied() != Some(current_hash) {
             repetition.history.push(current_hash);
         }
+        let endgame = material <= ENDGAME_MATERIAL_THRESHOLD;
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
@@ -53,6 +57,7 @@ impl SearchState {
             abort_flag,
             stopped: false,
             repetition,
+            endgame,
         }
     }
 
@@ -118,6 +123,10 @@ impl SearchState {
 
     fn is_threefold(&self, hash: u64) -> bool {
         self.repetition.is_threefold(hash)
+    }
+
+    fn in_endgame(&self) -> bool {
+        self.endgame
     }
 }
 
@@ -240,6 +249,7 @@ pub fn search_best_move(
         abort_flag.clone(),
         repetition_history,
         board.hash(),
+        board.material_count(),
     );
 
     let mut best_move = None;
@@ -411,6 +421,7 @@ fn negamax(
     const NULL_MOVE_REDUCTION: u8 = 2;
     if depth > NULL_MOVE_REDUCTION + 1
         && !ctx.board.is_in_check(ctx.board.active_color)
+        && !ctx.state.in_endgame()
     {
         let undo = ctx.board.make_null_move();
         let score = -negamax(
@@ -456,7 +467,12 @@ fn negamax(
         let mut child_depth = depth.saturating_sub(1);
         let mut reduced = false;
         let child_is_pv = is_pv && move_count == 1;
-        if depth >= 3 && move_count > 1 && !is_capture && !gives_check && !child_is_pv
+        if depth >= 3
+            && move_count > 1
+            && !is_capture
+            && !gives_check
+            && !child_is_pv
+            && !ctx.state.in_endgame()
         {
             reduced = true;
             let reduction = 1 + (move_count > 6) as u8 + (depth > 5) as u8;

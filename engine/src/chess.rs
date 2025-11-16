@@ -478,17 +478,30 @@ impl SplitMix64 {
 pub struct Move {
     pub from: Square,
     pub to: Square,
+    promotion: bool,
 }
 
 impl Move {
     pub const fn new(from: Square, to: Square) -> Self {
-        Self { from, to }
+        Self {
+            from,
+            to,
+            promotion: false,
+        }
+    }
+
+    pub const fn with_promotion(from: Square, to: Square) -> Self {
+        Self {
+            from,
+            to,
+            promotion: true,
+        }
     }
 
     pub fn to_uci(self) -> String {
         let mut text =
             format!("{}{}", self.from.to_algebraic(), self.to.to_algebraic());
-        if self.is_promotion() {
+        if self.promotion {
             text.push('q');
         }
         text
@@ -498,12 +511,12 @@ impl Move {
         Self {
             from: Square::unchecked(0, 0),
             to: Square::unchecked(0, 0),
+            promotion: false,
         }
     }
 
     pub fn is_promotion(self) -> bool {
-        (self.from.rank() == 6 && self.to.rank() == 7)
-            || (self.from.rank() == 1 && self.to.rank() == 0)
+        self.promotion
     }
 }
 
@@ -1156,6 +1169,17 @@ impl Board {
         self.zobrist
     }
 
+    pub fn material_count(&self) -> i32 {
+        let mut total = 0;
+        for color_idx in 0..2 {
+            for kind in PieceKind::all() {
+                let bb = self.piece_bitboards[color_idx][kind.idx()];
+                total += piece_value(kind) * bb.count_ones() as i32;
+            }
+        }
+        total
+    }
+
     fn rebuild_nnue_state(&mut self) {
         let mut white = NnueAccumulator::new(Color::White);
         white.rebuild(self);
@@ -1424,6 +1448,7 @@ impl Board {
         let mut pawns = self.piece_bitboards[color.idx()][PieceKind::Pawn.idx()];
         let pawn_dir: i8 = if color == Color::White { 1 } else { -1 };
         let pawn_start_rank = if color == Color::White { 1 } else { 6 };
+        let promotion_rank = if color == Color::White { 7 } else { 0 };
         while pawns != 0 {
             let idx = pawns.trailing_zeros() as u8;
             pawns &= pawns - 1;
@@ -1436,7 +1461,11 @@ impl Board {
             if let Some(one_step) = from.offset(pawn_dir, 0) {
                 let mask = square_bitboard(one_step);
                 if occupancy & mask == 0 && allowed & mask != 0 {
-                    buffer.push(Move::new(from, one_step));
+                    if one_step.rank() == promotion_rank {
+                        buffer.push(Move::with_promotion(from, one_step));
+                    } else {
+                        buffer.push(Move::new(from, one_step));
+                    }
                     if from.rank() == pawn_start_rank {
                         if let Some(two_step) = one_step.offset(pawn_dir, 0) {
                             let two_mask = square_bitboard(two_step);
@@ -1455,7 +1484,11 @@ impl Board {
                         continue;
                     }
                     if enemy_occ & mask != 0 {
-                        buffer.push(Move::new(from, target));
+                        if target.rank() == promotion_rank {
+                            buffer.push(Move::with_promotion(from, target));
+                        } else {
+                            buffer.push(Move::new(from, target));
+                        }
                     }
                 }
             }
@@ -2080,9 +2113,11 @@ mod tests {
 
     #[test]
     fn promotion_move_to_uci_includes_suffix() {
-        let mv = Move::new(Square::unchecked(6, 0), Square::unchecked(7, 0));
+        let mv =
+            Move::with_promotion(Square::unchecked(6, 0), Square::unchecked(7, 0));
         assert_eq!(mv.to_uci(), "a7a8q");
-        let capture = Move::new(Square::unchecked(1, 5), Square::unchecked(0, 4));
+        let capture =
+            Move::with_promotion(Square::unchecked(1, 5), Square::unchecked(0, 4));
         assert_eq!(capture.to_uci(), "f2e1q");
     }
 
