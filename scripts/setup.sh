@@ -1,15 +1,3 @@
-echo "Checking rust"
-if ! type rustup > /dev/null; then
-    echo "Rust is not installed. Now installing..."
-    curl https://sh.rustup.rs -sSf --output rust.sh
-    chmod +x rust.sh
-    ./rust.sh -qy
-    rm rust.sh
-    echo "Rust is now installed."
-else
-    echo "Rust is already installed."
-fi
-
 echo "Checking libtorch"
 if [ -d "./libtorch" ]; then
     echo "libtorch is already installed."
@@ -27,8 +15,4 @@ export LIBTORCH="$(pwd)/libtorch"
 export PATH="$LIBTORCH/bin${PATH:+:${PATH}}"
 export LD_LIBRARY_PATH="$LIBTORCH/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-cd engine
-export PATH="$HOME/.cargo/bin${PATH:+:${PATH}}"
-cargo build --release --bin suckfish 2>&1
-cp target/release/suckfish ../suckfish
 exit 0
