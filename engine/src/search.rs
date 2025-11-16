@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
 const MAX_PLY: usize = 64;
+const SEE_WINDOW: i32 = 100;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
@@ -244,7 +245,7 @@ pub fn search_best_move(
     let mut best_move = None;
     let mut completed_depth = 0;
     let mut last_score = 0;
-    const ASP_WINDOW: i32 = 50;
+    const ASP_WINDOW: i32 = 100;
 
     {
         let mut ctx = SearchContext {
@@ -444,7 +445,8 @@ fn negamax(
         move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
-        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -50 {
+        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -SEE_WINDOW
+        {
             ctx.board.unmake_move(undo);
             continue;
         }
@@ -540,7 +542,7 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         if ctx.board.piece_at(mv.to).is_none() {
             continue;
         }
-        if ctx.board.static_exchange_eval(mv) < -50 {
+        if ctx.board.static_exchange_eval(mv) < -SEE_WINDOW {
             continue;
         }
         let undo = ctx.board.make_move(mv);

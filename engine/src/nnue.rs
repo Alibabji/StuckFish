@@ -13,8 +13,10 @@ use tch::nn::OptimizerConfig;
 use tch::{nn, Device, Kind, Reduction, Tensor};
 
 const HALF_KA_DIM: i64 = 64 * 12 * 64;
-const DEFAULT_FEATURE_DIM: i64 = 256;
-const DEFAULT_HIDDEN_DIM: i64 = 32;
+const DEFAULT_FEATURE_DIM: i64 = 512;
+const DEFAULT_HIDDEN0_DIM: i64 = 192;
+const DEFAULT_HIDDEN1_DIM: i64 = 64;
+const DEFAULT_HIDDEN2_DIM: i64 = 32;
 pub(crate) const CLIPPED_RELU_CAP: f64 = 127.0;
 const TARGET_CP_CLIP: f32 = 2000.0;
 
@@ -22,7 +24,9 @@ const TARGET_CP_CLIP: f32 = 2000.0;
 pub struct NnueConfig {
     pub input_dim: i64,
     pub feature_dim: i64,
-    pub hidden_dim: i64,
+    pub hidden0_dim: i64,
+    pub hidden1_dim: i64,
+    pub hidden2_dim: i64,
 }
 
 impl Default for NnueConfig {
@@ -30,7 +34,9 @@ impl Default for NnueConfig {
         Self {
             input_dim: HALF_KA_DIM,
             feature_dim: DEFAULT_FEATURE_DIM,
-            hidden_dim: DEFAULT_HIDDEN_DIM,
+            hidden0_dim: DEFAULT_HIDDEN0_DIM,
+            hidden1_dim: DEFAULT_HIDDEN1_DIM,
+            hidden2_dim: DEFAULT_HIDDEN2_DIM,
         }
     }
 }
@@ -415,6 +421,7 @@ pub(crate) struct NnueLayers {
     pub(crate) view_feat: SparseAccumulator,
     pub(crate) hidden0: nn::Linear,
     pub(crate) hidden1: nn::Linear,
+    pub(crate) hidden2: nn::Linear,
     pub(crate) output: nn::Linear,
     pub(crate) config: NnueConfig,
 }
@@ -433,21 +440,28 @@ impl NnueLayers {
         let hidden0 = nn::linear(
             path / "hidden0",
             config.feature_dim,
-            config.hidden_dim,
+            config.hidden0_dim,
             linear_cfg,
         );
         let hidden1 = nn::linear(
             path / "hidden1",
-            config.hidden_dim,
-            config.hidden_dim,
+            config.hidden0_dim,
+            config.hidden1_dim,
             linear_cfg,
         );
-        let output = nn::linear(path / "output", config.hidden_dim, 1, linear_cfg);
+        let hidden2 = nn::linear(
+            path / "hidden2",
+            config.hidden1_dim,
+            config.hidden2_dim,
+            linear_cfg,
+        );
+        let output = nn::linear(path / "output", config.hidden2_dim, 1, linear_cfg);
 
         Self {
             view_feat,
             hidden0,
             hidden1,
+            hidden2,
             output,
             config: *config,
         }
@@ -457,6 +471,7 @@ impl NnueLayers {
         let mut x = clipped_relu(self.view_feat.forward_dense(features));
         x = clipped_relu(x.apply(&self.hidden0));
         x = clipped_relu(x.apply(&self.hidden1));
+        x = clipped_relu(x.apply(&self.hidden2));
         x.apply(&self.output)
     }
 
@@ -471,6 +486,7 @@ impl NnueLayers {
         let mut x = clipped_relu(Tensor::stack(&feat_activations, 0));
         x = clipped_relu(x.apply(&self.hidden0));
         x = clipped_relu(x.apply(&self.hidden1));
+        x = clipped_relu(x.apply(&self.hidden2));
         x.apply(&self.output)
     }
 

@@ -9,6 +9,7 @@ pub struct NnueRuntime {
     view: SparseAccumulatorRuntime,
     hidden0: LinearLayer,
     hidden1: LinearLayer,
+    hidden2: LinearLayer,
     output: LinearLayer,
 }
 
@@ -29,11 +30,13 @@ impl NnueRuntime {
         )?;
         let hidden0 = LinearLayer::from_linear(&layers.hidden0)?;
         let hidden1 = LinearLayer::from_linear(&layers.hidden1)?;
+        let hidden2 = LinearLayer::from_linear(&layers.hidden2)?;
         let output = LinearLayer::from_linear(&layers.output)?;
         Ok(Self {
             view,
             hidden0,
             hidden1,
+            hidden2,
             output,
         })
     }
@@ -48,6 +51,8 @@ impl NnueRuntime {
         x = self.hidden0.forward(&x);
         clipped_relu(&mut x);
         x = self.hidden1.forward(&x);
+        clipped_relu(&mut x);
+        x = self.hidden2.forward(&x);
         clipped_relu(&mut x);
         let out = self.output.forward(&x);
         let score = out
