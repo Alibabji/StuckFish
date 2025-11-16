@@ -70,8 +70,23 @@ env["LD_LIBRARY_PATH"] = f"{LIBTORCH}/lib" + (f":{old_ld}" if old_ld else "")
 
 print("Libtorch set.")
 
+download('https://sh.rustup.rs', 'rust.sh')
+run_with_err(
+    ['sh', 'rust.sh', '-qy'],
+    env=env
+)
+
+home = pathlib.Path(os.environ['HOME'])
+env["PATH"] = f'{home / ".cargo/bin"}' + f':{env["PATH"]}'
+
+run_with_err(
+    ['cargo', 'build', '--release', '--bin', 'suckfish'],
+    env=env,
+    cwd='engine',
+)
+
 engine = subprocess.Popen(
-    [os.path.join(os.getcwd(), 'suckfish')],
+    ['engine/target/release/suckfish', '--nnue-path', os.path.join(os.getcwd(), 'nnue.ot')],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.DEVNULL,
