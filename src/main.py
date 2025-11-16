@@ -3,8 +3,31 @@ from chess import Move
 import random
 import time, os, subprocess
 
-os.system('./scripts/setup.sh')
-while not os.path.isfile("flag"): time.sleep(0.1)
+setup = subprocess.Popen(
+    ['sh', '-c', './scripts/setup.sh'],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    bufsize=1,
+)
+for line in setup.stdout:
+    if not line:
+        break
+    print(line, end='', flush=True)
+retcode = setup.wait()
+if retcode != 0:
+    raise RuntimeError(f"setup failed with exit code {retcode}")
+
+LIBTORCH = os.path.join(os.getcwd(), "libtorch")
+os.environ["LIBTORCH"] = LIBTORCH
+# PATH
+old_path = os.environ.get("PATH", "")
+os.environ["PATH"] = f"{LIBTORCH}/bin" + (f":{old_path}" if old_path else "")
+# LD_LIBRARY_PATH
+old_ld = os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["LD_LIBRARY_PATH"] = f"{LIBTORCH}/lib" + (f":{old_ld}" if old_ld else "")
+
 engine = subprocess.Popen(
     ['./suckfish', '--nnue-path', 'nnue.ot'],
     stdin=subprocess.PIPE,
