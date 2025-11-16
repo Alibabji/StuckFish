@@ -1,5 +1,6 @@
 use crate::chess::{Board, Move, MoveList, PieceKind, piece_value};
 use crate::nnue_runtime::NnueRuntime;
+use crate::time_manager::TimeBudget;
 use crate::tt::{Bound, TranspositionTable};
 use std::sync::{
     Arc,
@@ -19,7 +20,8 @@ pub struct SearchStatistics {
 struct SearchState {
     killer_moves: [[Option<Move>; 2]; MAX_PLY],
     history: [[u32; 64]; 64],
-    deadline: Option<Instant>,
+    optimal_deadline: Option<Instant>,
+    hard_deadline: Option<Instant>,
     abort_flag: Option<Arc<AtomicBool>>,
     stopped: bool,
 }
@@ -31,11 +33,15 @@ fn move_indices(mv: Move) -> (usize, usize) {
 }
 
 impl SearchState {
-    fn new(deadline: Option<Instant>, abort_flag: Option<Arc<AtomicBool>>) -> Self {
+    fn new(
+        deadlines: Option<(Instant, Instant)>,
+        abort_flag: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             killer_moves: [[None; 2]; MAX_PLY],
             history: [[0; 64]; 64],
-            deadline,
+            optimal_deadline: deadlines.map(|d| d.0),
+            hard_deadline: deadlines.map(|d| d.1),
             abort_flag,
             stopped: false,
         }
@@ -77,8 +83,15 @@ impl SearchState {
                 return true;
             }
         }
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
+        let now = Instant::now();
+        if let Some(opt_deadline) = self.optimal_deadline {
+            if now >= opt_deadline {
+                self.stopped = true;
+                return true;
+            }
+        }
+        if let Some(hard_deadline) = self.hard_deadline {
+            if now >= hard_deadline {
                 self.stopped = true;
                 return true;
             }
@@ -116,7 +129,7 @@ pub fn search_best_move(
     board: &mut Board,
     tt: &mut TranspositionTable,
     max_depth: u8,
-    time_budget: Option<Duration>,
+    time_budget: Option<TimeBudget>,
     nnue_runner: &NnueRuntime,
     abort_flag: Option<Arc<AtomicBool>>,
 ) -> SearchReport {
@@ -133,8 +146,8 @@ pub fn search_best_move(
     }
 
     let start = Instant::now();
-    let deadline = time_budget.map(|budget| start + budget);
-    let mut state = SearchState::new(deadline, abort_flag.clone());
+    let deadlines = time_budget.map(|b| (start + b.optimal, start + b.maximum));
+    let mut state = SearchState::new(deadlines, abort_flag.clone());
 
     let mut best_move = None;
     let mut completed_depth = 0;

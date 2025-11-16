@@ -17,7 +17,7 @@ if [ -d "./libtorch" ]; then
 else
     echo "libtorch is not installed. Now installing..."
     wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.9.0%2Bcpu.zip"
-    mv libtorch* libtorch.zip
+    mv libtorch*.zip libtorch.zip
     rm -rf ./libtorch
     unzip libtorch.zip
     rm libtorch.zip

@@ -1,6 +1,7 @@
 use suckfish::chess::{Board, Move};
 use suckfish::nnue_runtime::NnueRuntime;
 use suckfish::search::{SearchReport, search_best_move};
+use suckfish::time_manager::{TimeBudget, TimeManager};
 use suckfish::tt::TranspositionTable;
 
 use anyhow::Result;
@@ -27,6 +28,7 @@ fn main() -> Result<()> {
     let nnue_runner = Arc::new(NnueRuntime::new(cmd_args.nnue_path)?);
     let mut tt = TranspositionTable::new(16);
     let mut ponder: Option<PonderHandle> = None;
+    let time_manager = TimeManager::default();
     loop {
         let mut cmdline = String::new();
         std::io::stdin().read_line(&mut cmdline)?;
@@ -59,13 +61,7 @@ fn main() -> Result<()> {
                 }
 
                 let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
-                let think_time = if time_ms > 0 {
-                    // Spend a small fraction of the remaining time.
-                    let slice = (time_ms / 30).max(10);
-                    Some(Duration::from_millis(slice))
-                } else {
-                    None
-                };
+                let think_time = time_manager.compute_budget(time_ms);
                 let sr = search_best_move(
                     &mut board,
                     &mut tt,
@@ -139,11 +135,15 @@ fn start_ponder(
 
     let mut reply_board = board_after.clone();
     let mut tmp_tt = TranspositionTable::new(16);
+    let quick_budget = TimeBudget {
+        optimal: Duration::from_millis(50),
+        maximum: Duration::from_millis(100),
+    };
     let reply_report = search_best_move(
         &mut reply_board,
         &mut tmp_tt,
         1,
-        Some(Duration::from_millis(50)),
+        Some(quick_budget),
         nnue.as_ref(),
         None,
     );
@@ -160,12 +160,16 @@ fn start_ponder(
     let nnue_clone = nnue.clone();
     let stop_clone = stop_flag.clone();
 
+    let ponder_budget = TimeBudget {
+        optimal: Duration::from_millis(1000),
+        maximum: Duration::from_millis(3000),
+    };
     let handle = thread::spawn(move || {
         let report = search_best_move(
             &mut ponder_board,
             &mut ponder_tt,
             8,
-            None,
+            Some(ponder_budget),
             nnue_clone.as_ref(),
             Some(stop_clone),
         );
