@@ -9,7 +9,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, TryRecvError},
+    mpsc::{self, Receiver},
     Arc,
 };
 use std::thread;
@@ -45,28 +45,72 @@ fn main() -> Result<()> {
                 let mut board = Board::from_fen(fen)?;
                 let position_hash = board.hash();
 
-                if let Some(mut handle) = ponder.take() {
+                let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
+                let default_budget = TimeBudget {
+                    optimal: Duration::from_millis(100),
+                    maximum: Duration::from_millis(300),
+                };
+                let think_time = time_manager
+                    .compute_budget(time_ms)
+                    .unwrap_or(default_budget);
+                if let Some(handle) = ponder.take() {
                     if handle.target_hash == position_hash {
-                        if let Some(sr) = handle.try_take_result() {
-                            eprintln!("{:?}, nps: {}", sr, sr.nps());
-                            if let Some(bm) = sr.best_move {
+                        if let Some(ponder_sr) = handle.take_result() {
+                            let remaining_opt = think_time
+                                .optimal
+                                .checked_sub(ponder_sr.elapsed)
+                                .unwrap_or_else(Duration::default);
+                            let remaining_max = think_time
+                                .maximum
+                                .checked_sub(ponder_sr.elapsed)
+                                .unwrap_or_else(Duration::default);
+                            let needs_search =
+                                remaining_max > Duration::from_millis(10);
+                            let final_report = if needs_search {
+                                let refined_budget = TimeBudget {
+                                    optimal: remaining_opt
+                                        .max(Duration::from_millis(1)),
+                                    maximum: remaining_max
+                                        .max(Duration::from_millis(1)),
+                                };
+                                let refined = search_best_move(
+                                    &mut board,
+                                    &mut tt,
+                                    32,
+                                    Some(refined_budget),
+                                    nnue_runner.as_ref(),
+                                    None,
+                                );
+                                if refined.depth >= ponder_sr.depth {
+                                    refined
+                                } else {
+                                    ponder_sr
+                                }
+                            } else {
+                                ponder_sr
+                            };
+                            eprintln!(
+                                "{:?}, nps: {}",
+                                final_report,
+                                final_report.nps()
+                            );
+                            if let Some(bm) = final_report.best_move {
                                 println!("{}", bm.to_uci());
                                 ponder =
                                     start_ponder(&board, bm, nnue_runner.clone());
                             }
                             continue;
                         }
+                    } else {
+                        handle.abort();
                     }
-                    handle.stop();
                 }
 
-                let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
-                let think_time = time_manager.compute_budget(time_ms);
                 let sr = search_best_move(
                     &mut board,
                     &mut tt,
                     32,
-                    think_time,
+                    Some(think_time),
                     nnue_runner.as_ref(),
                     None,
                 );
@@ -75,6 +119,13 @@ fn main() -> Result<()> {
                     println!("{}", bm.to_uci());
                     ponder = start_ponder(&board, bm, nnue_runner.clone());
                 }
+            }
+            Some("newgame") => {
+                if let Some(handle) = ponder.take() {
+                    handle.abort();
+                }
+                tt.clear();
+                println!("newgame ready");
             }
             _ => break,
         }
@@ -90,28 +141,25 @@ struct PonderHandle {
 }
 
 impl PonderHandle {
-    fn stop(mut self) {
+    fn take_result(mut self) -> Option<SearchReport> {
+        if let Ok(sr) = self.result_rx.try_recv() {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            return Some(sr);
+        }
         self.stop_flag.store(true, Ordering::Relaxed);
+        let result = self.result_rx.recv().ok();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        result
     }
 
-    fn try_take_result(&mut self) -> Option<SearchReport> {
-        match self.result_rx.try_recv() {
-            Ok(sr) => {
-                if let Some(handle) = self.handle.take() {
-                    let _ = handle.join();
-                }
-                Some(sr)
-            }
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                if let Some(handle) = self.handle.take() {
-                    let _ = handle.join();
-                }
-                None
-            }
+    fn abort(mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -154,8 +202,8 @@ fn start_ponder(
     let stop_clone = stop_flag.clone();
 
     let ponder_budget = TimeBudget {
-        optimal: Duration::from_millis(1000),
-        maximum: Duration::from_millis(3000),
+        optimal: Duration::from_secs(20),
+        maximum: Duration::from_secs(20),
     };
     let handle = thread::spawn(move || {
         let report = search_best_move(
