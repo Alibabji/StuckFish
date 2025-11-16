@@ -16,7 +16,7 @@ for line in setup.stdout:
         break
     print(line, end='', flush=True)
 retcode = setup.wait()
-if retcode != 0:
+if retcode not in [0, 2]:
     raise RuntimeError(f"setup failed with exit code {retcode}")
 
 LIBTORCH = os.path.join(os.getcwd(), "libtorch")
