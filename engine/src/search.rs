@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 const MATE_VALUE: i32 = 30_000;
 const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
 const MAX_PLY: usize = 64;
-const SEE_RANGE: i32 = 100;
+const SEE_RANGE: i32 = 50;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
