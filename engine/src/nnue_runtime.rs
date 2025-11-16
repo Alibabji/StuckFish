@@ -133,13 +133,13 @@ impl LinearLayer {
     fn forward(&self, input: &[f32]) -> Vec<f32> {
         debug_assert_eq!(input.len(), self.in_dim);
         let mut out = vec![0.0; self.out_dim];
-        for o in 0..self.out_dim {
+        for (o, out_value) in out.iter_mut().enumerate() {
             let mut sum = self.bias[o];
             let row = &self.weights[o * self.in_dim..(o + 1) * self.in_dim];
             for i in 0..self.in_dim {
                 sum += row[i] * input[i];
             }
-            out[o] = sum;
+            *out_value = sum;
         }
         out
     }

@@ -65,7 +65,7 @@ fn main() -> Result<()> {
                 let sr = search_best_move(
                     &mut board,
                     &mut tt,
-                    8,
+                    32,
                     think_time,
                     nnue_runner.as_ref(),
                     None,
