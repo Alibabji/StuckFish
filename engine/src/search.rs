@@ -9,7 +9,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const MATE_VALUE: i32 = 30_000;
+const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
 const MAX_PLY: usize = 64;
+const SEE_RANGE: i32 = 100;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
@@ -122,6 +124,7 @@ impl SearchState {
     fn is_threefold(&self, hash: u64) -> bool {
         self.repetition.is_threefold(hash)
     }
+
     fn in_endgame(&self) -> bool {
         self.endgame
     }
@@ -252,7 +255,7 @@ pub fn search_best_move(
     let mut best_move = None;
     let mut completed_depth = 0;
     let mut last_score = 0;
-    const ASP_WINDOW: i32 = 50;
+    const ASP_WINDOW: i32 = 100;
 
     {
         let mut ctx = SearchContext {
@@ -453,7 +456,7 @@ fn negamax(
         move_count += 1;
         let undo = ctx.board.make_move(mv);
         let is_capture = undo.captured_piece.is_some();
-        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -50 {
+        if is_capture && depth > 1 && ctx.board.static_exchange_eval(mv) < -SEE_RANGE {
             ctx.board.unmake_move(undo);
             continue;
         }
@@ -554,7 +557,7 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
         if ctx.board.piece_at(mv.to).is_none() {
             continue;
         }
-        if ctx.board.static_exchange_eval(mv) < -50 {
+        if ctx.board.static_exchange_eval(mv) < -SEE_RANGE {
             continue;
         }
         let undo = ctx.board.make_move(mv);
@@ -639,4 +642,3 @@ fn move_score(
 
     score
 }
-const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
