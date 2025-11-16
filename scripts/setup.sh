@@ -27,7 +27,18 @@ export LIBTORCH="$(pwd)/libtorch"
 export PATH="$LIBTORCH/bin${PATH:+:${PATH}}"
 export LD_LIBRARY_PATH="$LIBTORCH/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+echo test1
 cd engine
-. "$HOME/.cargo/env"
-cargo build --release --bin suckfish
+echo test2
+# Use cargo directly from rustup's default install location to avoid sourcing.
+CARGO_BIN="$HOME/.cargo/bin/cargo"
+echo $CARGO_BIN
+if [ ! -x "$CARGO_BIN" ]; then
+    CARGO_BIN="$(command -v cargo || true)"
+fi
+if [ ! -x "$CARGO_BIN" ]; then
+    echo "cargo binary not found; ensure rustup installed correctly."
+    exit 1
+fi
+"$CARGO_BIN" build --release --bin suckfish
 cp target/release/suckfish ../
